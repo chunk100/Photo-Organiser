@@ -1,5 +1,4 @@
 #Version 1 - with stars and comments.  Only available in full display
-#5 - database needs to be same directory as python.  simples
 
 import os
 import sqlite3
@@ -14,11 +13,16 @@ import shutil
 class PhotoOrganizer:
     CONFIG_KEY_LAST_FOLDER = "last_folder"
 
+
     def __init__(self, root):
         self.root = root
         self.root.title("Photo Organizer")
-        self.db_path = None
-        self.current_folder = None
+        
+        # 1. Define paths based strictly on script location
+        self.script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.db_path = os.path.join(self.script_dir, "photo_data.db")
+        self.current_folder = self.script_dir
+        
         self.fullscreen_images = []
         self.current_image_index = 0
         self.thumb_refs = {}
@@ -26,55 +30,108 @@ class PhotoOrganizer:
 
         self.setup_ui()
         
-        # Check database before doing anything else
+        # 2. Check/Create database
         if not self.check_and_setup_db():
-            return  # Exit if database setup failed
+            return  # Exit if user chose to quit
         
+        # 3. Automatic startup from the script directory
         threading.Thread(target=self.cleanup_orphan_thumbnails, daemon=True).start()
-
-        last = self.load_setting(self.CONFIG_KEY_LAST_FOLDER)
-        if last and os.path.isdir(last):
-            self.current_folder = last
-            self.populate_tree(start_folder=last)
-            threading.Thread(target=self.scan_and_store_thumbnails, args=(last,), daemon=True).start()
-        else:
-            self.populate_tree()
+        self.populate_tree(start_folder=self.script_dir)
+        threading.Thread(target=self.scan_and_store_thumbnails, args=(self.script_dir,), daemon=True).start()
 
     def check_and_setup_db(self):
-        """Check if database exists and handle accordingly. Returns True if OK to continue, False if should exit."""
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.db_path = os.path.join(script_dir, "photo_data.db")
-        
-        # Check if database exists
-        if not os.path.exists(self.db_path):
-            result = messagebox.askyesnocancel(
-                "Database Not Found",
-                f"Database not found at:\n{self.db_path}\n\n"
-                "Would you like to:\n"
-                "• Yes - Create a new database\n"
-                "• No - Exit program (place database in correct location)\n"
-                "• Cancel - Exit program",
-                icon='warning'
-            )
-            
-            if result is True:
-                # User chose Yes - create new database
-                self.init_db()
-                messagebox.showinfo("Database Created", 
-                                   f"New database created at:\n{self.db_path}")
-                return True
-            else:
-                # User chose No or Cancel - exit program
-                messagebox.showinfo("Program Closing", 
-                                   f"Please place your database file at:\n{self.db_path}\n\n"
-                                   "Then restart the program.")
-                self.root.after(100, self.root.destroy)  # Destroy after message box closes
-                return False
-        else:
-            # Database exists, initialize it
+        """Strictly manages DB location and handles path migration if moved."""
+        if os.path.exists(self.db_path):
             self.init_db()
+            
+            # 1. Load the stored root
+            raw_stored_root = self.load_setting("photo_root_path")
+            
+            if raw_stored_root:
+                # 2. Normalize both paths to standardise slashes for comparison
+                stored_root = os.path.normpath(raw_stored_root)
+                current_root = os.path.normpath(self.script_dir)
+                
+                # 3. Now the comparison will work regardless of / or \
+                if stored_root != current_root:
+                    if self.prompt_for_path_update(stored_root, current_root):
+                        self.relocate_database_paths(stored_root, current_root)
+                    else:
+                        self.root.destroy()
+                        return False
             return True
+            
+        # ... (rest of the prompt for new DB) ...
+        # If DB doesn't exist, prompt the user to create one
+        result = messagebox.askyesno(
+            "Database Not Found",
+            f"No database found in:\n{self.script_dir}\n\n"
+            "Create a new database here?",
+            icon='question'
+        )
+        
+        if result:
+            self.init_db()
+            self.save_setting("photo_root_path", self.script_dir)
+            self.save_setting(self.CONFIG_KEY_LAST_FOLDER, self.script_dir)
+            return True
+        else:
+            self.root.destroy()
+            return False
 
+    def prompt_for_path_update(self, old_root, new_root):
+        """Asks the user if they want to update the database to the new location."""
+        msg = (
+            f"Location Mismatch Detected!\n\n"
+            f"Database expects: {old_root}\n"
+            f"Current location: {new_root}\n\n"
+            "This usually happens if you move the folder or change drive letters.\n"
+            "Would you like to update all database records to this new path?"
+        )
+        return messagebox.askyesno("Update Database Paths?", msg, icon='warning')
+
+    def relocate_database_paths(self, old_root, new_root):
+        """Standardizes and updates all file paths in the 'photos' table."""
+        # Fix for the slash direction mismatch (/ vs \)
+        old_root = os.path.normpath(old_root)
+        new_root = os.path.normpath(new_root)
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # 1. Update the 'path' column (Full path to every photo)
+            # We cut off the old root string and prepend the new root string
+            cursor.execute("""
+                UPDATE photos 
+                SET path = ? || SUBSTR(path, LENGTH(?) + 1)
+                WHERE path LIKE ? || '%'
+            """, (new_root, old_root, old_root))
+
+            # 2. Update the 'folder' column (Used for the navigation tree)
+            cursor.execute("""
+                UPDATE photos 
+                SET folder = ? || SUBSTR(folder, LENGTH(?) + 1)
+                WHERE folder LIKE ? || '%'
+            """, (new_root, old_root, old_root))
+            
+            changes = conn.total_changes
+            conn.commit()
+            conn.close()
+            
+            # 3. Update settings to ensure they match the new location
+            self.save_setting("photo_root_path", new_root)
+            self.save_setting(self.CONFIG_KEY_LAST_FOLDER, new_root)
+            self.current_folder = new_root
+            
+            messagebox.showinfo("Success", 
+                f"Database updated successfully!\n\n"
+                f"Fixed {changes} records to use the new path:\n{new_root}")
+            
+        except Exception as e:
+            messagebox.showerror("Relocation Error", 
+                f"Failed to update database paths: {str(e)}")
+            
     def setup_ui(self):
         self.root.geometry("1200x800")
         
@@ -120,7 +177,7 @@ class PhotoOrganizer:
 
         bottom_frame = ttk.Frame(self.root)
         bottom_frame.pack(fill=tk.X)
-        ttk.Button(bottom_frame, text="Choose Scan Folder", command=self.choose_scan_folder).pack(side=tk.LEFT, padx=5, pady=5)
+        #ttk.Button(bottom_frame, text="Set Photo Root Folder", command=self.choose_scan_folder).pack(side=tk.LEFT, padx=5, pady=5)
         ttk.Button(bottom_frame, text="Rescan", command=self.rescan_current_folder).pack(side=tk.LEFT, padx=5, pady=5)
 
         self.status_frame = ttk.Frame(self.root)
@@ -228,17 +285,9 @@ class PhotoOrganizer:
         
         threading.Thread(target=self.load_thumbnails_from_db, args=(path,), daemon=True).start()
 
-    def choose_scan_folder(self):
-        folder = filedialog.askdirectory()
-        if folder:
-            self.save_setting(self.CONFIG_KEY_LAST_FOLDER, folder)
-            self.current_folder = folder
-            self.populate_tree(start_folder=folder)
-            threading.Thread(target=self.scan_and_store_thumbnails, args=(folder,), daemon=True).start()
-
     def rescan_current_folder(self):
-        if self.current_folder and os.path.isdir(self.current_folder):
-            threading.Thread(target=self.scan_and_store_thumbnails, args=(self.current_folder,), daemon=True).start()
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        threading.Thread(target=self.scan_and_store_thumbnails, args=(script_dir,), daemon=True).start()
 
     def scan_and_store_thumbnails(self, folder):
         self.set_status(f"Scanning and storing thumbnails: {folder}...")
