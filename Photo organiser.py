@@ -10,6 +10,15 @@ import io
 import time
 import shutil
 
+# Add this import for HEIC/HEIF support
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HEIF_SUPPORT = True
+except ImportError:
+    HEIF_SUPPORT = False
+    print("pillow-heif not installed. HEIC/HEIF files will not be supported.")
+
 class PhotoOrganizer:
     CONFIG_KEY_LAST_FOLDER = "last_folder"
 
@@ -289,9 +298,39 @@ class PhotoOrganizer:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         threading.Thread(target=self.scan_and_store_thumbnails, args=(script_dir,), daemon=True).start()
 
+    def get_supported_image_extensions(self):
+        """Returns a tuple of supported image extensions"""
+        extensions = [
+            # JPEG formats
+            ".jpg", ".jpeg", ".jpe", ".jfif",
+            # PNG
+            ".png",
+            # GIF
+            ".gif",
+            # TIFF
+            ".tif", ".tiff",
+            # BMP
+            ".bmp", ".dib",
+            # WebP
+            ".webp",
+            # ICO
+            ".ico",
+            # PPM/PGM/PBM
+            ".ppm", ".pgm", ".pbm", ".pnm"
+        ]
+        
+        # Add HEIC/HEIF if supported
+        if HEIF_SUPPORT:
+            extensions.extend([".heic", ".heif"])
+        
+        return tuple(extensions)
+
+
+
     def scan_and_store_thumbnails(self, folder):
         self.set_status(f"Scanning and storing thumbnails: {folder}...")
-        image_extensions = (".jpg", ".jpeg", ".png", ".gif")
+        
+        image_extensions = self.get_supported_image_extensions()
 
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
@@ -337,6 +376,8 @@ class PhotoOrganizer:
         conn.close()
         self.set_status(f"Scanning complete. Processed {processed} files in {folder}")
         self.root.after(0, lambda: self.load_thumbnails_from_db(folder))
+
+
 
     def load_thumbnails_from_db(self, folder):
         self.set_status(f"Loading thumbnails from database: {folder}...")
@@ -789,10 +830,14 @@ class PhotoOrganizer:
         
         threading.Thread(target=self._scan_year_thread, args=(source, year), daemon=True).start()
 
+
+
+
     def _scan_year_thread(self, source_folder, target_year):
         from PIL.ExifTags import TAGS
         import datetime
         
+        image_extensions = self.get_supported_image_extensions()
         files_found = []
         
         try:
@@ -805,7 +850,7 @@ class PhotoOrganizer:
                         file_month = None
                         
                         # Try EXIF for image files
-                        if f.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.heic', '.heif')):
+                        if f.lower().endswith(image_extensions):
                             try:
                                 img = Image.open(full_path)
                                 exif_data = img._getexif()
@@ -852,6 +897,8 @@ class PhotoOrganizer:
             
         except Exception as e:
             self._update_year_results(f"\nError during scan: {str(e)}\n")
+
+
 
     def _update_year_results(self, message):
         def _update():
@@ -1081,7 +1128,25 @@ class PhotoOrganizer:
         threading.Thread(target=self._scan_videos_thread, args=(source,), daemon=True).start()
 
     def _scan_videos_thread(self, source_folder):
-        video_extensions = ('.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.m4v', '.mpg', '.mpeg', '.3gp', '.webm', '.ogv')
+        video_extensions = (
+            # Common formats (you already have these)
+            '.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.m4v', '.mpg', '.mpeg', 
+            '.3gp', '.webm', '.ogv',
+            # Additional MPEG variants
+            '.m2v', '.m2ts', '.mts', '.ts',
+            # QuickTime
+            '.qt',
+            # RealMedia
+            '.rm', '.rmvb',
+            # DivX/Xvid
+            '.divx',
+            # VOB (DVD)
+            '.vob',
+            # Apple formats
+            '.m4p',
+            # Other formats
+            '.asf', '.f4v', '.f4p', '.f4a', '.f4b'
+        )
         videos_found = []
         
         try:
