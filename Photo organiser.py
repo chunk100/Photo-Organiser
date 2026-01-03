@@ -23,6 +23,7 @@ class PhotoOrganizer:
     CONFIG_KEY_LAST_FOLDER = "last_folder"
 
 
+
     def __init__(self, root):
         self.root = root
         self.root.title("Photo Organizer")
@@ -30,6 +31,9 @@ class PhotoOrganizer:
         # 1. Define paths based strictly on script location
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
         self.db_path = os.path.join(self.script_dir, "photo_data.db")
+        
+        # Initialize photo_root (will be set properly after DB check)
+        self.photo_root = self.script_dir
         self.current_folder = self.script_dir
         
         self.fullscreen_images = []
@@ -43,10 +47,16 @@ class PhotoOrganizer:
         if not self.check_and_setup_db():
             return  # Exit if user chose to quit
         
-        # 3. Automatic startup from the script directory
+        # 3. Load the photo root from database (after migration is complete)
+        stored_root = self.load_setting("photo_root_path")
+        if stored_root and os.path.isdir(stored_root):
+            self.photo_root = stored_root
+            self.current_folder = stored_root
+        
+        # 4. Automatic startup from the photo root directory
         threading.Thread(target=self.cleanup_orphan_thumbnails, daemon=True).start()
-        self.populate_tree(start_folder=self.script_dir)
-        threading.Thread(target=self.scan_and_store_thumbnails, args=(self.script_dir,), daemon=True).start()
+        self.populate_tree(start_folder=self.photo_root)
+        threading.Thread(target=self.scan_and_store_thumbnails, args=(self.photo_root,), daemon=True).start()
 
     def check_and_setup_db(self):
         """Strictly manages DB location and handles path migration if moved."""
@@ -295,8 +305,8 @@ class PhotoOrganizer:
         threading.Thread(target=self.load_thumbnails_from_db, args=(path,), daemon=True).start()
 
     def rescan_current_folder(self):
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        threading.Thread(target=self.scan_and_store_thumbnails, args=(script_dir,), daemon=True).start()
+        # Rescan from the photo root, not just the currently selected folder
+        threading.Thread(target=self.scan_and_store_thumbnails, args=(self.photo_root,), daemon=True).start()
 
     def get_supported_image_extensions(self):
         """Returns a tuple of supported image extensions"""
