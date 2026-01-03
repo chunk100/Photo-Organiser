@@ -1,4 +1,4 @@
-#Version 1 - with stars and comments.  Only available in full display
+#Version 8 - with EXIF orientation correction and expanded image format support
 
 import os
 import sqlite3
@@ -10,7 +10,7 @@ import io
 import time
 import shutil
 
-# Add this import for HEIC/HEIF support
+# Add HEIC/HEIF support if available
 try:
     import pillow_heif
     pillow_heif.register_heif_opener()
@@ -21,8 +21,6 @@ except ImportError:
 
 class PhotoOrganizer:
     CONFIG_KEY_LAST_FOLDER = "last_folder"
-
-
 
     def __init__(self, root):
         self.root = root
@@ -58,6 +56,33 @@ class PhotoOrganizer:
         self.populate_tree(start_folder=self.photo_root)
         threading.Thread(target=self.scan_and_store_thumbnails, args=(self.photo_root,), daemon=True).start()
 
+    def get_supported_image_extensions(self):
+        """Returns a tuple of supported image extensions"""
+        extensions = [
+            # JPEG formats
+            ".jpg", ".jpeg", ".jpe", ".jfif",
+            # PNG
+            ".png",
+            # GIF
+            ".gif",
+            # TIFF
+            ".tif", ".tiff",
+            # BMP
+            ".bmp", ".dib",
+            # WebP
+            ".webp",
+            # ICO
+            ".ico",
+            # PPM/PGM/PBM
+            ".ppm", ".pgm", ".pbm", ".pnm"
+        ]
+        
+        # Add HEIC/HEIF if supported
+        if HEIF_SUPPORT:
+            extensions.extend([".heic", ".heif"])
+        
+        return tuple(extensions)
+
     def check_and_setup_db(self):
         """Strictly manages DB location and handles path migration if moved."""
         if os.path.exists(self.db_path):
@@ -80,7 +105,6 @@ class PhotoOrganizer:
                         return False
             return True
             
-        # ... (rest of the prompt for new DB) ...
         # If DB doesn't exist, prompt the user to create one
         result = messagebox.askyesno(
             "Database Not Found",
@@ -111,7 +135,6 @@ class PhotoOrganizer:
 
     def relocate_database_paths(self, old_root, new_root):
         """Standardizes and updates all file paths in the 'photos' table."""
-        # Fix for the slash direction mismatch (/ vs \)
         old_root = os.path.normpath(old_root)
         new_root = os.path.normpath(new_root)
 
@@ -120,7 +143,6 @@ class PhotoOrganizer:
             cursor = conn.cursor()
             
             # 1. Update the 'path' column (Full path to every photo)
-            # We cut off the old root string and prepend the new root string
             cursor.execute("""
                 UPDATE photos 
                 SET path = ? || SUBSTR(path, LENGTH(?) + 1)
@@ -152,7 +174,13 @@ class PhotoOrganizer:
                 f"Failed to update database paths: {str(e)}")
             
     def setup_ui(self):
-        self.root.geometry("1200x800")
+        # Start in maximized mode
+        self.root.state('zoomed')  # For Windows
+        # For cross-platform compatibility, also try:
+        try:
+            self.root.attributes('-zoomed', True)  # For Linux
+        except:
+            pass
         
         menubar = tk.Menu(self.root)
         self.root.config(menu=menubar)
@@ -196,8 +224,7 @@ class PhotoOrganizer:
 
         bottom_frame = ttk.Frame(self.root)
         bottom_frame.pack(fill=tk.X)
-        #ttk.Button(bottom_frame, text="Set Photo Root Folder", command=self.choose_scan_folder).pack(side=tk.LEFT, padx=5, pady=5)
-        ttk.Button(bottom_frame, text="Rescan", command=self.rescan_current_folder).pack(side=tk.LEFT, padx=5, pady=5)
+        ttk.Button(bottom_frame, text="Rescan Current Folder", command=self.rescan_current_folder).pack(side=tk.LEFT, padx=5, pady=5)
 
         self.status_frame = ttk.Frame(self.root)
         self.status_frame.pack(fill=tk.X, side=tk.BOTTOM)
@@ -305,37 +332,86 @@ class PhotoOrganizer:
         threading.Thread(target=self.load_thumbnails_from_db, args=(path,), daemon=True).start()
 
     def rescan_current_folder(self):
-        # Rescan from the photo root, not just the currently selected folder
-        threading.Thread(target=self.scan_and_store_thumbnails, args=(self.photo_root,), daemon=True).start()
+        # Rescan only the currently selected folder and its subfolders
+        if self.current_folder and os.path.isdir(self.current_folder):
+            self.set_status(f"Starting rescan of {self.current_folder}...")
+            threading.Thread(target=self.scan_and_store_thumbnails_with_stats, args=(self.current_folder,), daemon=True).start()
+        else:
+            messagebox.showwarning("No Folder Selected", "Please select a folder in the tree view to rescan.")
 
-    def get_supported_image_extensions(self):
-        """Returns a tuple of supported image extensions"""
-        extensions = [
-            # JPEG formats
-            ".jpg", ".jpeg", ".jpe", ".jfif",
-            # PNG
-            ".png",
-            # GIF
-            ".gif",
-            # TIFF
-            ".tif", ".tiff",
-            # BMP
-            ".bmp", ".dib",
-            # WebP
-            ".webp",
-            # ICO
-            ".ico",
-            # PPM/PGM/PBM
-            ".ppm", ".pgm", ".pbm", ".pnm"
-        ]
+
+    def scan_and_store_thumbnails_with_stats(self, folder):
+        """Scan and store thumbnails with summary statistics at the end"""
+        image_extensions = self.get_supported_image_extensions()
+
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+
+        total = 0
+        for _root, _dirs, files in os.walk(folder):
+            for f in files:
+                if f.lower().endswith(image_extensions):
+                    total += 1
+
+        new_files = 0
+        orientations_corrected = 0
+        errors = 0
         
-        # Add HEIC/HEIF if supported
-        if HEIF_SUPPORT:
-            extensions.extend([".heic", ".heif"])
+        for root_dir, dirs, files in os.walk(folder):
+            for f in files:
+                if f.lower().endswith(image_extensions):
+                    full_path = os.path.join(root_dir, f)
+
+                    cur.execute("SELECT path FROM photos WHERE path=?", (full_path,))
+                    if cur.fetchone() is None:
+                        try:
+                            img = Image.open(full_path)
+                            
+                            # Check if image has orientation tag that needs correction
+                            try:
+                                exif = img.getexif()
+                                if exif and 274 in exif and exif[274] != 1:
+                                    orientations_corrected += 1
+                            except:
+                                pass
+                            
+                            # Apply EXIF orientation correction
+                            img = ImageOps.exif_transpose(img)
+                            
+                            img_copy = img.copy()
+                            img_copy.thumbnail((150, 150))
+                            with io.BytesIO() as output:
+                                img_copy.save(output, format='PNG')
+                                thumb_blob = output.getvalue()
+                            cur.execute(
+                                "INSERT OR REPLACE INTO photos (path, folder, thumbnail) VALUES (?, ?, ?)",
+                                (full_path, root_dir, thumb_blob)
+                            )
+                            new_files += 1
+                        except Exception as e:
+                            errors += 1
+                            print(f"Error processing {full_path}: {e}")
+
+        conn.commit()
+
+        deleted = self.cleanup_orphan_thumbnails()
+        self.vacuum_db()
         
-        return tuple(extensions)
-
-
+        conn.close()
+        
+        # Build summary status message
+        status_msg = f"Rescan complete: {new_files} new files"
+        if orientations_corrected > 0:
+            status_msg += f" | {orientations_corrected} orientations corrected"
+        if errors > 0:
+            status_msg += f" | {errors} errors"
+        if deleted > 0:
+            status_msg += f" | {deleted} removed"
+        
+        self.set_status(status_msg)
+        
+        # Reload thumbnails for current folder
+        self.root.after(0, lambda: self.load_thumbnails_from_db(folder))
 
     def scan_and_store_thumbnails(self, folder):
         self.set_status(f"Scanning and storing thumbnails: {folder}...")
@@ -352,6 +428,8 @@ class PhotoOrganizer:
                     total += 1
 
         processed = 0
+        orientations_corrected = 0
+        
         for root_dir, dirs, files in os.walk(folder):
             for f in files:
                 if f.lower().endswith(image_extensions):
@@ -362,6 +440,18 @@ class PhotoOrganizer:
                     if cur.fetchone() is None:
                         try:
                             img = Image.open(full_path)
+                            
+                            # Check if image has orientation tag that needs correction
+                            try:
+                                exif = img.getexif()
+                                if exif and 274 in exif and exif[274] != 1:
+                                    orientations_corrected += 1
+                            except:
+                                pass
+                            
+                            # Apply EXIF orientation correction (this is very fast)
+                            img = ImageOps.exif_transpose(img)
+                            
                             img_copy = img.copy()
                             img_copy.thumbnail((150, 150))
                             with io.BytesIO() as output:
@@ -384,10 +474,25 @@ class PhotoOrganizer:
 
         threading.Thread(target=_cleanup_and_vacuum, daemon=True).start()
         conn.close()
-        self.set_status(f"Scanning complete. Processed {processed} files in {folder}")
+        
+        # Enhanced completion message with orientation info
+        completion_msg = f"Scanning complete. Processed {processed} files in {folder}"
+        if orientations_corrected > 0:
+            completion_msg += f" | Corrected {orientations_corrected} orientations"
+        
+        self.set_status(completion_msg)
+        
+        # Show a popup notification if any orientations were corrected
+        if orientations_corrected > 0:
+            self.root.after(0, lambda: messagebox.showinfo(
+                "Scan Complete",
+                f"Scan finished!\n\n"
+                f"Total files processed: {processed}\n"
+                f"Orientations corrected: {orientations_corrected}\n\n"
+                f"Images with incorrect EXIF orientation have been rotated to display correctly."
+            ))
+        
         self.root.after(0, lambda: self.load_thumbnails_from_db(folder))
-
-
 
     def load_thumbnails_from_db(self, folder):
         self.set_status(f"Loading thumbnails from database: {folder}...")
@@ -407,6 +512,7 @@ class PhotoOrganizer:
         for path, thumb_blob, starred in rows:
             try:
                 img = Image.open(io.BytesIO(thumb_blob))
+                # No need to apply exif_transpose here - already corrected when stored
 
                 if starred:
                     draw = ImageDraw.Draw(img)
@@ -452,7 +558,15 @@ class PhotoOrganizer:
         self.current_image_index = index
         self.img_win = tk.Toplevel(self.root)
         self.img_win.title(os.path.basename(self.fullscreen_images[index]))
-        self.img_win.geometry("900x700")
+        
+        # Maximize the image viewer window
+        self.img_win.state('zoomed')  # For Windows
+        # For cross-platform compatibility, also try:
+        try:
+            self.img_win.attributes('-zoomed', True)  # For Linux
+        except:
+            pass
+        
         self.img_win.configure(background='black')
 
         self.label_var = tk.StringVar()
@@ -475,6 +589,10 @@ class PhotoOrganizer:
     def show_image_window(self):
         path = self.fullscreen_images[self.current_image_index]
         img = Image.open(path)
+        
+        # Apply EXIF orientation correction
+        img = ImageOps.exif_transpose(img)
+        
         self.img_win.update_idletasks()
         win_width = max(100, self.img_win.winfo_width())
         win_height = max(100, self.img_win.winfo_height())
@@ -547,6 +665,10 @@ class PhotoOrganizer:
 
         if lbl:
             base = Image.open(path)
+            
+            # Apply EXIF orientation correction
+            base = ImageOps.exif_transpose(base)
+            
             base.thumbnail((150,150))
 
             if new_value:
@@ -840,9 +962,6 @@ class PhotoOrganizer:
         
         threading.Thread(target=self._scan_year_thread, args=(source, year), daemon=True).start()
 
-
-
-
     def _scan_year_thread(self, source_folder, target_year):
         from PIL.ExifTags import TAGS
         import datetime
@@ -907,8 +1026,6 @@ class PhotoOrganizer:
             
         except Exception as e:
             self._update_year_results(f"\nError during scan: {str(e)}\n")
-
-
 
     def _update_year_results(self, message):
         def _update():
@@ -978,17 +1095,13 @@ class PhotoOrganizer:
                     errors += 1
                     continue
                 
-                # Get month name
                 month_name = datetime.datetime.strptime(month_num, "%m").strftime("%B")
-                
-                # Create month subdirectory
                 month_dir = os.path.join(dest_folder, month_name)
                 os.makedirs(month_dir, exist_ok=True)
                 
                 filename = os.path.basename(file_path)
                 dest_path = os.path.join(month_dir, filename)
                 
-                # Handle filename conflicts
                 if os.path.exists(dest_path):
                     base, ext = os.path.splitext(filename)
                     counter = 1
@@ -1139,7 +1252,7 @@ class PhotoOrganizer:
 
     def _scan_videos_thread(self, source_folder):
         video_extensions = (
-            # Common formats (you already have these)
+            # Common formats
             '.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.m4v', '.mpg', '.mpeg', 
             '.3gp', '.webm', '.ogv',
             # Additional MPEG variants
