@@ -1,4 +1,4 @@
-#Version 8 - with EXIF orientation correction and expanded image format support
+#Version 8 - with EXIF orientation correction and expanded image format support and duplicate finder
 
 import os
 import sqlite3
@@ -190,6 +190,7 @@ class PhotoOrganizer:
         tools_menu.add_command(label="Copy Starred Photos", command=self.open_copy_starred_window)
         tools_menu.add_command(label="Move Files by Year and Month", command=self.open_move_by_year_window)
         tools_menu.add_command(label="Copy Video Files", command=self.open_copy_videos_window)
+        tools_menu.add_command(label="Find Duplicate Photos", command=self.open_duplicate_finder_window)
         
         paned = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
@@ -1401,6 +1402,347 @@ class PhotoOrganizer:
         ))
         
         self.root.after(0, lambda: self.video_copy_button.config(state='normal'))
+
+    def open_duplicate_finder_window(self):
+        """Opens window to find and manage duplicate photos"""
+        dup_win = tk.Toplevel(self.root)
+        dup_win.title("Find Duplicate Photos")
+        dup_win.geometry("1000x700")
+        dup_win.transient(self.root)
+        
+        # New photos folder
+        new_frame = ttk.LabelFrame(dup_win, text="New Photos Folder (to check for duplicates)", padding=10)
+        new_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        self.dup_new_var = tk.StringVar()
+        ttk.Entry(new_frame, textvariable=self.dup_new_var, state='readonly').pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,5))
+        ttk.Button(new_frame, text="Browse...", command=self.select_dup_new).pack(side=tk.RIGHT)
+        
+        # Existing photos folder
+        existing_frame = ttk.LabelFrame(dup_win, text="Existing Photos Folder (your current library)", padding=10)
+        existing_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        self.dup_existing_var = tk.StringVar()
+        if self.photo_root and os.path.isdir(self.photo_root):
+            self.dup_existing_var.set(self.photo_root)
+        ttk.Entry(existing_frame, textvariable=self.dup_existing_var, state='readonly').pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,5))
+        ttk.Button(existing_frame, text="Browse...", command=self.select_dup_existing).pack(side=tk.RIGHT)
+        
+        # Scan button
+        scan_frame = ttk.Frame(dup_win)
+        scan_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        self.dup_scan_button = ttk.Button(scan_frame, text="Scan for Duplicates", command=self.scan_for_duplicates)
+        self.dup_scan_button.pack(side=tk.LEFT, padx=5)
+        
+        self.dup_status_var = tk.StringVar(value="Select folders and click 'Scan for Duplicates'")
+        ttk.Label(scan_frame, textvariable=self.dup_status_var).pack(side=tk.LEFT, padx=10)
+        
+        # Results frame with scrollbar
+        results_frame = ttk.LabelFrame(dup_win, text="Duplicates Found", padding=10)
+        results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # Canvas and scrollbar for results
+        canvas = tk.Canvas(results_frame)
+        scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=canvas.yview)
+        self.dup_results_frame = ttk.Frame(canvas)
+        
+        canvas.create_window((0, 0), window=self.dup_results_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        self.dup_results_frame.bind("<Configure>", 
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        
+        # Bottom buttons
+        button_frame = ttk.Frame(dup_win)
+        button_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        self.dup_delete_button = ttk.Button(button_frame, text="Delete Selected Duplicates", 
+                                           command=self.delete_selected_duplicates, state='disabled')
+        self.dup_delete_button.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(button_frame, text="Close", command=dup_win.destroy).pack(side=tk.RIGHT, padx=5)
+        
+        self.dup_window = dup_win
+        self.dup_checkboxes = []  # Store checkbox variables and paths
+    
+    def select_dup_new(self):
+        folder = filedialog.askdirectory(title="Select New Photos Folder")
+        if folder:
+            self.dup_new_var.set(folder)
+    
+    def select_dup_existing(self):
+        folder = filedialog.askdirectory(title="Select Existing Photos Folder")
+        if folder:
+            self.dup_existing_var.set(folder)
+    
+    def scan_for_duplicates(self):
+        new_folder = self.dup_new_var.get()
+        existing_folder = self.dup_existing_var.get()
+        
+        if not new_folder or not existing_folder:
+            messagebox.showerror("Error", "Please select both folders")
+            return
+        if not os.path.isdir(new_folder):
+            messagebox.showerror("Error", "New photos folder does not exist")
+            return
+        if not os.path.isdir(existing_folder):
+            messagebox.showerror("Error", "Existing photos folder does not exist")
+            return
+        
+        self.dup_scan_button.config(state='disabled')
+        self.dup_delete_button.config(state='disabled')
+        self.dup_status_var.set("Scanning for duplicates...")
+        
+        threading.Thread(target=self._scan_duplicates_thread, 
+                        args=(new_folder, existing_folder), daemon=True).start()
+    
+    def _scan_duplicates_thread(self, new_folder, existing_folder):
+        """Scan for duplicate photos using file hash comparison"""
+        import hashlib
+        import datetime
+        
+        image_extensions = self.get_supported_image_extensions()
+        
+        def get_file_hash(filepath):
+            """Calculate MD5 hash of file"""
+            hash_md5 = hashlib.md5()
+            try:
+                with open(filepath, "rb") as f:
+                    for chunk in iter(lambda: f.read(4096), b""):
+                        hash_md5.update(chunk)
+                return hash_md5.hexdigest()
+            except:
+                return None
+        
+        def get_file_info(filepath):
+            """Get file metadata"""
+            try:
+                stat = os.stat(filepath)
+                mod_time = datetime.datetime.fromtimestamp(stat.st_mtime)
+                size = stat.st_size
+                return {
+                    'path': filepath,
+                    'size': size,
+                    'modified': mod_time,
+                    'size_mb': size / (1024 * 1024)
+                }
+            except:
+                return None
+        
+        # Build hash dictionary for existing photos
+        self.root.after(0, lambda: self.dup_status_var.set("Scanning existing photos..."))
+        existing_hashes = {}
+        
+        for root_dir, dirs, files in os.walk(existing_folder):
+            for f in files:
+                if f.lower().endswith(image_extensions):
+                    full_path = os.path.join(root_dir, f)
+                    file_hash = get_file_hash(full_path)
+                    if file_hash:
+                        existing_hashes[file_hash] = full_path
+        
+        # Check new photos against existing
+        self.root.after(0, lambda: self.dup_status_var.set("Checking new photos for duplicates..."))
+        duplicates = []
+        
+        for root_dir, dirs, files in os.walk(new_folder):
+            for f in files:
+                if f.lower().endswith(image_extensions):
+                    full_path = os.path.join(root_dir, f)
+                    file_hash = get_file_hash(full_path)
+                    
+                    if file_hash and file_hash in existing_hashes:
+                        new_info = get_file_info(full_path)
+                        existing_info = get_file_info(existing_hashes[file_hash])
+                        
+                        if new_info and existing_info:
+                            duplicates.append({
+                                'new': new_info,
+                                'existing': existing_info
+                            })
+        
+        # Display results
+        self.root.after(0, lambda: self._display_duplicates(duplicates))
+    
+    def _display_duplicates(self, duplicates):
+        """Display duplicate photos in the results frame"""
+        # Clear previous results
+        for widget in self.dup_results_frame.winfo_children():
+            widget.destroy()
+        
+        self.dup_checkboxes = []
+        
+        if not duplicates:
+            self.dup_status_var.set("No duplicates found!")
+            ttk.Label(self.dup_results_frame, text="No duplicate photos were found.", 
+                     font=('Arial', 12)).pack(pady=20)
+            self.dup_scan_button.config(state='normal')
+            return
+        
+        self.dup_status_var.set(f"Found {len(duplicates)} duplicate(s)")
+        
+        # Header
+        header_frame = ttk.Frame(self.dup_results_frame)
+        header_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(header_frame, text="Delete?", font=('Arial', 10, 'bold')).grid(row=0, column=0, padx=5)
+        ttk.Label(header_frame, text="New Photo", font=('Arial', 10, 'bold')).grid(row=0, column=1, padx=20)
+        ttk.Label(header_frame, text="", font=('Arial', 10, 'bold')).grid(row=0, column=2, padx=20)
+        ttk.Label(header_frame, text="Existing Photo", font=('Arial', 10, 'bold')).grid(row=0, column=3, padx=20)
+        
+        ttk.Separator(self.dup_results_frame, orient='horizontal').pack(fill=tk.X, pady=5)
+        
+        # Display each duplicate pair
+        for idx, dup in enumerate(duplicates):
+            self._create_duplicate_row(idx, dup)
+        
+        self.dup_scan_button.config(state='normal')
+        self.dup_delete_button.config(state='normal')
+    
+    def _create_duplicate_row(self, idx, dup):
+        """Create a row showing a duplicate pair"""
+        row_frame = ttk.Frame(self.dup_results_frame)
+        row_frame.pack(fill=tk.X, pady=10, padx=5)
+        
+        # Checkbox for deletion
+        delete_var = tk.BooleanVar(value=True)  # Default to checked
+        checkbox = ttk.Checkbutton(row_frame, variable=delete_var)
+        checkbox.grid(row=0, column=0, padx=5, sticky='n')
+        
+        self.dup_checkboxes.append({
+            'var': delete_var,
+            'path': dup['new']['path']
+        })
+        
+        # New photo info
+        new_frame = ttk.Frame(row_frame, relief='solid', borderwidth=1)
+        new_frame.grid(row=0, column=1, padx=10, sticky='nsew')
+        
+        # Try to load thumbnail
+        try:
+            img = Image.open(dup['new']['path'])
+            img = ImageOps.exif_transpose(img)
+            img.thumbnail((150, 150))
+            photo = ImageTk.PhotoImage(img)
+            lbl = ttk.Label(new_frame, image=photo)
+            lbl.image = photo  # Keep reference
+            lbl.pack(pady=5)
+        except:
+            ttk.Label(new_frame, text="[Image]", width=20).pack(pady=5)
+        
+        ttk.Label(new_frame, text=f"File: {os.path.basename(dup['new']['path'])}", 
+                 wraplength=200).pack()
+        ttk.Label(new_frame, text=f"Size: {dup['new']['size_mb']:.2f} MB").pack()
+        ttk.Label(new_frame, text=f"Modified: {dup['new']['modified'].strftime('%Y-%m-%d %H:%M')}").pack(pady=(0,5))
+        
+        # Arrow/equals sign
+        ttk.Label(row_frame, text="=", font=('Arial', 20)).grid(row=0, column=2, padx=10)
+        
+        # Existing photo info
+        existing_frame = ttk.Frame(row_frame, relief='solid', borderwidth=1)
+        existing_frame.grid(row=0, column=3, padx=10, sticky='nsew')
+        
+        # Try to load thumbnail
+        try:
+            img = Image.open(dup['existing']['path'])
+            img = ImageOps.exif_transpose(img)
+            img.thumbnail((150, 150))
+            photo = ImageTk.PhotoImage(img)
+            lbl = ttk.Label(existing_frame, image=photo)
+            lbl.image = photo  # Keep reference
+            lbl.pack(pady=5)
+        except:
+            ttk.Label(existing_frame, text="[Image]", width=20).pack(pady=5)
+        
+        ttk.Label(existing_frame, text=f"File: {os.path.basename(dup['existing']['path'])}", 
+                 wraplength=200).pack()
+        ttk.Label(existing_frame, text=f"Size: {dup['existing']['size_mb']:.2f} MB").pack()
+        ttk.Label(existing_frame, text=f"Modified: {dup['existing']['modified'].strftime('%Y-%m-%d %H:%M')}").pack(pady=(0,5))
+        
+        # Separator
+        ttk.Separator(self.dup_results_frame, orient='horizontal').pack(fill=tk.X, pady=10)
+    
+    def delete_selected_duplicates(self):
+        """Delete all checked duplicate photos after confirmation"""
+        to_delete = [item['path'] for item in self.dup_checkboxes if item['var'].get()]
+        
+        if not to_delete:
+            messagebox.showinfo("No Selection", "No photos selected for deletion.")
+            return
+        
+        # Confirmation dialog
+        result = messagebox.askyesno(
+            "Confirm Deletion",
+            f"⚠️ WARNING ⚠️\n\n"
+            f"You are about to permanently delete {len(to_delete)} photo(s).\n\n"
+            f"This action CANNOT be undone!\n\n"
+            f"Are you sure you want to continue?",
+            icon='warning'
+        )
+        
+        if not result:
+            return
+        
+        # Second confirmation
+        result2 = messagebox.askyesno(
+            "Final Confirmation",
+            f"This is your final warning.\n\n"
+            f"Delete {len(to_delete)} duplicate photo(s) permanently?",
+            icon='warning'
+        )
+        
+        if not result2:
+            return
+        
+        # Collect unique directories that contain deleted files
+        affected_folders = set()
+        for path in to_delete:
+            folder = os.path.dirname(path)
+            affected_folders.add(folder)
+        
+        # Delete files
+        deleted = 0
+        errors = 0
+        
+        for path in to_delete:
+            try:
+                os.remove(path)
+                deleted += 1
+            except Exception as e:
+                errors += 1
+                print(f"Error deleting {path}: {e}")
+        
+        messagebox.showinfo(
+            "Deletion Complete",
+            f"Deleted {deleted} photo(s) successfully.\n"
+            f"Errors: {errors}\n\n"
+            f"Database will be updated to remove deleted photos."
+        )
+        
+        # Close the duplicate finder window
+        self.dup_window.destroy()
+        
+        # Rescan affected folders if any files were deleted
+        if deleted > 0:
+            self.set_status(f"Updating database after deleting {deleted} duplicate(s)...")
+            threading.Thread(target=self._rescan_after_deletion, 
+                           args=(affected_folders,), daemon=True).start()
+    
+    def _rescan_after_deletion(self, affected_folders):
+        """Rescan folders after deletion to update the database"""
+        # Run cleanup to remove deleted photos from database
+        deleted_entries = self.cleanup_orphan_thumbnails()
+        
+        # Update status with results
+        self.set_status(f"Database updated: removed {deleted_entries} deleted photo(s) from database")
+        
+        # If current folder is affected, reload thumbnails
+        if self.current_folder in affected_folders:
+            self.root.after(0, lambda: self.load_thumbnails_from_db(self.current_folder))
 
 
 if __name__ == "__main__":
