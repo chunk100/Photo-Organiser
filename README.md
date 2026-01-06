@@ -16,3 +16,10 @@ This will copy all starred photos from one directory to another.  Useful if want
 An easier way to collect a load of photos from folders into years / months
 ### Copy video files
 Allows a directory to be selected to copy all videos.  Useful for then creating video montages
+### Find duplicate photos
+There are 2 modes here:
+#### Compare 2 folders
+This finds duplicates between a 'new' folder (photos just copied in) and the 'existing photos' (those already in the library.
+This will give a delete option but will default to deleting the 'new' photo as the one in the 'existing' folder is considered to be the master
+#### Find duplicates within a single folder
+This will show the file path of each and will allow you to chose which one you want to keep
