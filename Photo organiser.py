@@ -1,4 +1,4 @@
-#Version 8 - with EXIF orientation correction and expanded image format support and duplicate finder
+#Version 8 - with EXIF orientation correction and expanded image format support
 
 import os
 import sqlite3
@@ -51,10 +51,11 @@ class PhotoOrganizer:
             self.photo_root = stored_root
             self.current_folder = stored_root
         
-        # 4. Automatic startup from the photo root directory
+        # 4. Automatic startup - populate tree and cleanup, but skip automatic scan
         threading.Thread(target=self.cleanup_orphan_thumbnails, daemon=True).start()
         self.populate_tree(start_folder=self.photo_root)
-        threading.Thread(target=self.scan_and_store_thumbnails, args=(self.photo_root,), daemon=True).start()
+        # Removed automatic scan on startup to avoid OneDrive downloads
+        # Use "Rescan Current Folder" button to manually scan when needed
 
     def get_supported_image_extensions(self):
         """Returns a tuple of supported image extensions"""
@@ -258,11 +259,13 @@ class PhotoOrganizer:
                 tags TEXT,
                 starred INTEGER DEFAULT 0,
                 thumbnail BLOB,
-                label TEXT
+                label TEXT,
+                file_hash TEXT
             )
         """)
         cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_folder ON photos(folder)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_hash ON photos(file_hash)")
         conn.commit()
         conn.close()
 
@@ -343,6 +346,10 @@ class PhotoOrganizer:
 
     def scan_and_store_thumbnails_with_stats(self, folder):
         """Scan and store thumbnails with summary statistics at the end"""
+        import hashlib
+        
+        self.set_status(f"Counting files in {folder}...")
+        
         image_extensions = self.get_supported_image_extensions()
 
         conn = sqlite3.connect(self.db_path)
@@ -354,6 +361,7 @@ class PhotoOrganizer:
                 if f.lower().endswith(image_extensions):
                     total += 1
 
+        processed = 0
         new_files = 0
         orientations_corrected = 0
         errors = 0
@@ -362,10 +370,20 @@ class PhotoOrganizer:
             for f in files:
                 if f.lower().endswith(image_extensions):
                     full_path = os.path.join(root_dir, f)
+                    
+                    # Update status with progress
+                    self.set_status(f"Scanning ({processed}/{total}): {full_path}")
 
                     cur.execute("SELECT path FROM photos WHERE path=?", (full_path,))
                     if cur.fetchone() is None:
                         try:
+                            # Calculate MD5 hash
+                            hash_md5 = hashlib.md5()
+                            with open(full_path, "rb") as f_hash:
+                                for chunk in iter(lambda: f_hash.read(4096), b""):
+                                    hash_md5.update(chunk)
+                            file_hash = hash_md5.hexdigest()
+                            
                             img = Image.open(full_path)
                             
                             # Check if image has orientation tag that needs correction
@@ -385,16 +403,19 @@ class PhotoOrganizer:
                                 img_copy.save(output, format='PNG')
                                 thumb_blob = output.getvalue()
                             cur.execute(
-                                "INSERT OR REPLACE INTO photos (path, folder, thumbnail) VALUES (?, ?, ?)",
-                                (full_path, root_dir, thumb_blob)
+                                "INSERT OR REPLACE INTO photos (path, folder, thumbnail, file_hash) VALUES (?, ?, ?, ?)",
+                                (full_path, root_dir, thumb_blob, file_hash)
                             )
                             new_files += 1
                         except Exception as e:
                             errors += 1
                             print(f"Error processing {full_path}: {e}")
+                    
+                    processed += 1
 
         conn.commit()
 
+        self.set_status("Running cleanup and database optimization...")
         deleted = self.cleanup_orphan_thumbnails()
         self.vacuum_db()
         
@@ -417,6 +438,7 @@ class PhotoOrganizer:
     def scan_and_store_thumbnails(self, folder):
         self.set_status(f"Scanning and storing thumbnails: {folder}...")
         
+        import hashlib
         image_extensions = self.get_supported_image_extensions()
 
         conn = sqlite3.connect(self.db_path)
@@ -440,6 +462,13 @@ class PhotoOrganizer:
                     cur.execute("SELECT path FROM photos WHERE path=?", (full_path,))
                     if cur.fetchone() is None:
                         try:
+                            # Calculate MD5 hash
+                            hash_md5 = hashlib.md5()
+                            with open(full_path, "rb") as f_hash:
+                                for chunk in iter(lambda: f_hash.read(4096), b""):
+                                    hash_md5.update(chunk)
+                            file_hash = hash_md5.hexdigest()
+                            
                             img = Image.open(full_path)
                             
                             # Check if image has orientation tag that needs correction
@@ -459,8 +488,8 @@ class PhotoOrganizer:
                                 img_copy.save(output, format='PNG')
                                 thumb_blob = output.getvalue()
                             cur.execute(
-                                "INSERT OR REPLACE INTO photos (path, folder, thumbnail) VALUES (?, ?, ?)",
-                                (full_path, root_dir, thumb_blob)
+                                "INSERT OR REPLACE INTO photos (path, folder, thumbnail, file_hash) VALUES (?, ?, ?, ?)",
+                                (full_path, root_dir, thumb_blob, file_hash)
                             )
                         except Exception as e:
                             print(f"Error processing {full_path}: {e}")
@@ -1407,26 +1436,49 @@ class PhotoOrganizer:
         """Opens window to find and manage duplicate photos"""
         dup_win = tk.Toplevel(self.root)
         dup_win.title("Find Duplicate Photos")
-        dup_win.geometry("1000x700")
+        dup_win.geometry("1000x750")
         dup_win.transient(self.root)
         
+        # Mode selection
+        mode_frame = ttk.LabelFrame(dup_win, text="Detection Mode", padding=10)
+        mode_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        self.dup_mode_var = tk.StringVar(value="compare")
+        ttk.Radiobutton(mode_frame, text="Compare two folders (find duplicates between new and existing photos)", 
+                       variable=self.dup_mode_var, value="compare", 
+                       command=self.update_duplicate_mode).pack(anchor=tk.W, pady=2)
+        ttk.Radiobutton(mode_frame, text="Find duplicates within a single folder", 
+                       variable=self.dup_mode_var, value="single", 
+                       command=self.update_duplicate_mode).pack(anchor=tk.W, pady=2)
+        
+        # Container for folder selection (so we can manage packing order)
+        self.folder_container = ttk.Frame(dup_win)
+        self.folder_container.pack(fill=tk.X, padx=10, pady=5)
+        
         # New photos folder
-        new_frame = ttk.LabelFrame(dup_win, text="New Photos Folder (to check for duplicates)", padding=10)
-        new_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.new_frame = ttk.LabelFrame(self.folder_container, text="New Photos Folder (to check for duplicates)", padding=10)
         
         self.dup_new_var = tk.StringVar()
-        ttk.Entry(new_frame, textvariable=self.dup_new_var, state='readonly').pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,5))
-        ttk.Button(new_frame, text="Browse...", command=self.select_dup_new).pack(side=tk.RIGHT)
+        ttk.Entry(self.new_frame, textvariable=self.dup_new_var, state='readonly').pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,5))
+        ttk.Button(self.new_frame, text="Browse...", command=self.select_dup_new).pack(side=tk.RIGHT)
         
         # Existing photos folder
-        existing_frame = ttk.LabelFrame(dup_win, text="Existing Photos Folder (your current library)", padding=10)
-        existing_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.existing_frame = ttk.LabelFrame(self.folder_container, text="Existing Photos Folder (your current library)", padding=10)
         
         self.dup_existing_var = tk.StringVar()
         if self.photo_root and os.path.isdir(self.photo_root):
             self.dup_existing_var.set(self.photo_root)
-        ttk.Entry(existing_frame, textvariable=self.dup_existing_var, state='readonly').pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,5))
-        ttk.Button(existing_frame, text="Browse...", command=self.select_dup_existing).pack(side=tk.RIGHT)
+        ttk.Entry(self.existing_frame, textvariable=self.dup_existing_var, state='readonly').pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,5))
+        ttk.Button(self.existing_frame, text="Browse...", command=self.select_dup_existing).pack(side=tk.RIGHT)
+        
+        # Single folder (for single mode)
+        self.single_frame = ttk.LabelFrame(self.folder_container, text="Folder to Scan for Duplicates", padding=10)
+        
+        self.dup_single_var = tk.StringVar()
+        if self.current_folder and os.path.isdir(self.current_folder):
+            self.dup_single_var.set(self.current_folder)
+        ttk.Entry(self.single_frame, textvariable=self.dup_single_var, state='readonly').pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,5))
+        ttk.Button(self.single_frame, text="Browse...", command=self.select_dup_single).pack(side=tk.RIGHT)
         
         # Scan button
         scan_frame = ttk.Frame(dup_win)
@@ -1468,6 +1520,31 @@ class PhotoOrganizer:
         
         self.dup_window = dup_win
         self.dup_checkboxes = []  # Store checkbox variables and paths
+        
+        # Set initial mode
+        self.update_duplicate_mode()
+    
+    def update_duplicate_mode(self):
+        """Update UI based on selected duplicate detection mode"""
+        mode = self.dup_mode_var.get()
+        
+        # Hide all frames first
+        self.new_frame.pack_forget()
+        self.existing_frame.pack_forget()
+        self.single_frame.pack_forget()
+        
+        if mode == "compare":
+            # Show two folder selection
+            self.new_frame.pack(fill=tk.X, pady=(0,5))
+            self.existing_frame.pack(fill=tk.X, pady=(0,5))
+        else:  # single
+            # Show single folder selection
+            self.single_frame.pack(fill=tk.X, pady=(0,5))
+    
+    def select_dup_single(self):
+        folder = filedialog.askdirectory(title="Select Folder to Scan for Duplicates")
+        if folder:
+            self.dup_single_var.set(folder)
     
     def select_dup_new(self):
         folder = filedialog.askdirectory(title="Select New Photos Folder")
@@ -1480,28 +1557,48 @@ class PhotoOrganizer:
             self.dup_existing_var.set(folder)
     
     def scan_for_duplicates(self):
-        new_folder = self.dup_new_var.get()
-        existing_folder = self.dup_existing_var.get()
+        mode = self.dup_mode_var.get()
         
-        if not new_folder or not existing_folder:
-            messagebox.showerror("Error", "Please select both folders")
-            return
-        if not os.path.isdir(new_folder):
-            messagebox.showerror("Error", "New photos folder does not exist")
-            return
-        if not os.path.isdir(existing_folder):
-            messagebox.showerror("Error", "Existing photos folder does not exist")
-            return
+        if mode == "compare":
+            new_folder = self.dup_new_var.get()
+            existing_folder = self.dup_existing_var.get()
+            
+            if not new_folder or not existing_folder:
+                messagebox.showerror("Error", "Please select both folders")
+                return
+            if not os.path.isdir(new_folder):
+                messagebox.showerror("Error", "New photos folder does not exist")
+                return
+            if not os.path.isdir(existing_folder):
+                messagebox.showerror("Error", "Existing photos folder does not exist")
+                return
+            
+            self.dup_scan_button.config(state='disabled')
+            self.dup_delete_button.config(state='disabled')
+            self.dup_status_var.set("Scanning for duplicates...")
+            
+            threading.Thread(target=self._scan_duplicates_compare, 
+                            args=(new_folder, existing_folder), daemon=True).start()
         
-        self.dup_scan_button.config(state='disabled')
-        self.dup_delete_button.config(state='disabled')
-        self.dup_status_var.set("Scanning for duplicates...")
-        
-        threading.Thread(target=self._scan_duplicates_thread, 
-                        args=(new_folder, existing_folder), daemon=True).start()
+        else:  # single mode
+            single_folder = self.dup_single_var.get()
+            
+            if not single_folder:
+                messagebox.showerror("Error", "Please select a folder")
+                return
+            if not os.path.isdir(single_folder):
+                messagebox.showerror("Error", "Folder does not exist")
+                return
+            
+            self.dup_scan_button.config(state='disabled')
+            self.dup_delete_button.config(state='disabled')
+            self.dup_status_var.set("Scanning for duplicates within folder...")
+            
+            threading.Thread(target=self._scan_duplicates_single, 
+                            args=(single_folder,), daemon=True).start()
     
-    def _scan_duplicates_thread(self, new_folder, existing_folder):
-        """Scan for duplicate photos using file hash comparison"""
+    def _scan_duplicates_compare(self, new_folder, existing_folder):
+        """Scan for duplicate photos using file hash comparison from database"""
         import hashlib
         import datetime
         
@@ -1533,27 +1630,62 @@ class PhotoOrganizer:
             except:
                 return None
         
-        # Build hash dictionary for existing photos
-        self.root.after(0, lambda: self.dup_status_var.set("Scanning existing photos..."))
-        existing_hashes = {}
+        # Build hash dictionary from database for existing photos
+        self.root.after(0, lambda: self.dup_status_var.set("Loading existing photo hashes from database..."))
+        
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        
+        # Get all hashes for photos in existing folder from database
+        cur.execute("""
+            SELECT file_hash, path FROM photos 
+            WHERE folder LIKE ? AND file_hash IS NOT NULL
+        """, (existing_folder + '%',))
+        
+        db_hashes = {}
+        for file_hash, path in cur.fetchall():
+            if file_hash:
+                db_hashes[file_hash] = path
+        
+        conn.close()
+        
+        self.root.after(0, lambda: self.dup_status_var.set(f"Loaded {len(db_hashes)} hashes from database"))
+        
+        # For any existing photos not in database, scan them
+        self.root.after(0, lambda: self.dup_status_var.set("Scanning for unhashed existing photos..."))
+        existing_hashes = db_hashes.copy()
         
         for root_dir, dirs, files in os.walk(existing_folder):
             for f in files:
                 if f.lower().endswith(image_extensions):
                     full_path = os.path.join(root_dir, f)
-                    file_hash = get_file_hash(full_path)
-                    if file_hash:
-                        existing_hashes[file_hash] = full_path
+                    # Check if this file's hash is already in our dictionary
+                    if full_path not in existing_hashes.values():
+                        file_hash = get_file_hash(full_path)
+                        if file_hash and file_hash not in existing_hashes:
+                            existing_hashes[file_hash] = full_path
         
-        # Check new photos against existing
+        # Check new photos against existing (using database hashes when available)
         self.root.after(0, lambda: self.dup_status_var.set("Checking new photos for duplicates..."))
         duplicates = []
+        
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
         
         for root_dir, dirs, files in os.walk(new_folder):
             for f in files:
                 if f.lower().endswith(image_extensions):
                     full_path = os.path.join(root_dir, f)
-                    file_hash = get_file_hash(full_path)
+                    
+                    # Try to get hash from database first
+                    cur.execute("SELECT file_hash FROM photos WHERE path=?", (full_path,))
+                    row = cur.fetchone()
+                    
+                    if row and row[0]:
+                        file_hash = row[0]
+                    else:
+                        # Calculate hash if not in database
+                        file_hash = get_file_hash(full_path)
                     
                     if file_hash and file_hash in existing_hashes:
                         new_info = get_file_info(full_path)
@@ -1564,6 +1696,92 @@ class PhotoOrganizer:
                                 'new': new_info,
                                 'existing': existing_info
                             })
+        
+        conn.close()
+        
+        # Display results
+        self.root.after(0, lambda: self._display_duplicates(duplicates))
+    
+    def _scan_duplicates_single(self, folder):
+        """Scan for duplicate photos within a single folder"""
+        import hashlib
+        import datetime
+        
+        image_extensions = self.get_supported_image_extensions()
+        
+        def get_file_hash(filepath):
+            """Calculate MD5 hash of file"""
+            hash_md5 = hashlib.md5()
+            try:
+                with open(filepath, "rb") as f:
+                    for chunk in iter(lambda: f.read(4096), b""):
+                        hash_md5.update(chunk)
+                return hash_md5.hexdigest()
+            except:
+                return None
+        
+        def get_file_info(filepath):
+            """Get file metadata"""
+            try:
+                stat = os.stat(filepath)
+                mod_time = datetime.datetime.fromtimestamp(stat.st_mtime)
+                size = stat.st_size
+                return {
+                    'path': filepath,
+                    'size': size,
+                    'modified': mod_time,
+                    'size_mb': size / (1024 * 1024)
+                }
+            except:
+                return None
+        
+        self.root.after(0, lambda: self.dup_status_var.set("Scanning folder for duplicates..."))
+        
+        # Build hash dictionary for all photos in folder
+        hash_dict = {}  # hash -> list of file paths
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        
+        for root_dir, dirs, files in os.walk(folder):
+            for f in files:
+                if f.lower().endswith(image_extensions):
+                    full_path = os.path.join(root_dir, f)
+                    
+                    # Try to get hash from database first
+                    cur.execute("SELECT file_hash FROM photos WHERE path=?", (full_path,))
+                    row = cur.fetchone()
+                    
+                    if row and row[0]:
+                        file_hash = row[0]
+                    else:
+                        # Calculate hash if not in database
+                        file_hash = get_file_hash(full_path)
+                    
+                    if file_hash:
+                        if file_hash not in hash_dict:
+                            hash_dict[file_hash] = []
+                        hash_dict[file_hash].append(full_path)
+        
+        conn.close()
+        
+        # Find duplicates (hashes with more than one file)
+        self.root.after(0, lambda: self.dup_status_var.set("Identifying duplicates..."))
+        duplicates = []
+        
+        for file_hash, paths in hash_dict.items():
+            if len(paths) > 1:
+                # Multiple files with same hash = duplicates
+                # Treat first as "existing", rest as "new" (to delete)
+                existing_path = paths[0]
+                existing_info = get_file_info(existing_path)
+                
+                for dup_path in paths[1:]:
+                    dup_info = get_file_info(dup_path)
+                    if existing_info and dup_info:
+                        duplicates.append({
+                            'new': dup_info,
+                            'existing': existing_info
+                        })
         
         # Display results
         self.root.after(0, lambda: self._display_duplicates(duplicates))
