@@ -1599,36 +1599,11 @@ class PhotoOrganizer:
     
     def _scan_duplicates_compare(self, new_folder, existing_folder):
         """Scan for duplicate photos using file hash comparison from database"""
-        import hashlib
         import datetime
         
-        image_extensions = self.get_supported_image_extensions()
-        
-        def get_file_hash(filepath):
-            """Calculate MD5 hash of file"""
-            hash_md5 = hashlib.md5()
-            try:
-                with open(filepath, "rb") as f:
-                    for chunk in iter(lambda: f.read(4096), b""):
-                        hash_md5.update(chunk)
-                return hash_md5.hexdigest()
-            except:
-                return None
-        
-        def get_file_info(filepath):
-            """Get file metadata"""
-            try:
-                stat = os.stat(filepath)
-                mod_time = datetime.datetime.fromtimestamp(stat.st_mtime)
-                size = stat.st_size
-                return {
-                    'path': filepath,
-                    'size': size,
-                    'modified': mod_time,
-                    'size_mb': size / (1024 * 1024)
-                }
-            except:
-                return None
+        # Normalize paths to use system separators
+        new_folder = os.path.normpath(new_folder)
+        existing_folder = os.path.normpath(existing_folder)
         
         # Build hash dictionary from database for existing photos
         self.root.after(0, lambda: self.dup_status_var.set("Loading existing photo hashes from database..."))
@@ -1636,154 +1611,250 @@ class PhotoOrganizer:
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
         
-        # Get all hashes for photos in existing folder from database
+        # Get all hashes and paths for photos in existing folder
         cur.execute("""
-            SELECT file_hash, path FROM photos 
+            SELECT file_hash, path, thumbnail FROM photos 
             WHERE folder LIKE ? AND file_hash IS NOT NULL
         """, (existing_folder + '%',))
         
-        db_hashes = {}
-        for file_hash, path in cur.fetchall():
+        existing_hashes = {}
+        existing_thumbnails = {}
+        for file_hash, path, thumbnail in cur.fetchall():
             if file_hash:
-                db_hashes[file_hash] = path
+                existing_hashes[file_hash] = path
+                if thumbnail:
+                    existing_thumbnails[path] = thumbnail
         
-        conn.close()
+        print(f"DEBUG - Found {len(existing_hashes)} photos in existing folder")
         
-        self.root.after(0, lambda: self.dup_status_var.set(f"Loaded {len(db_hashes)} hashes from database"))
+        if len(existing_hashes) == 0:
+            cur.execute("SELECT DISTINCT folder FROM photos LIMIT 5")
+            sample_folders = [row[0] for row in cur.fetchall()]
+            error_msg = f"No scanned photos found in existing folder:\n{existing_folder}\n\n"
+            error_msg += f"Sample folders in database:\n"
+            error_msg += "\n".join(sample_folders) if sample_folders else "(No folders found)"
+            error_msg += "\n\nPlease scan this folder first."
+            
+            self.root.after(0, lambda: self.dup_status_var.set("No photos found in existing folder"))
+            self.root.after(0, lambda: messagebox.showwarning("No Photos Found", error_msg))
+            self.root.after(0, lambda: self.dup_scan_button.config(state='normal'))
+            conn.close()
+            return
         
-        # For any existing photos not in database, scan them
-        self.root.after(0, lambda: self.dup_status_var.set("Scanning for unhashed existing photos..."))
-        existing_hashes = db_hashes.copy()
+        self.root.after(0, lambda: self.dup_status_var.set(f"Loaded {len(existing_hashes)} hashes from existing folder"))
         
-        for root_dir, dirs, files in os.walk(existing_folder):
-            for f in files:
-                if f.lower().endswith(image_extensions):
-                    full_path = os.path.join(root_dir, f)
-                    # Check if this file's hash is already in our dictionary
-                    if full_path not in existing_hashes.values():
-                        file_hash = get_file_hash(full_path)
-                        if file_hash and file_hash not in existing_hashes:
-                            existing_hashes[file_hash] = full_path
-        
-        # Check new photos against existing (using database hashes when available)
+        # Check new photos against existing - get file info from database
         self.root.after(0, lambda: self.dup_status_var.set("Checking new photos for duplicates..."))
         duplicates = []
         
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
+        print(f"DEBUG - Looking for new folder: {new_folder}")
         
-        for root_dir, dirs, files in os.walk(new_folder):
-            for f in files:
-                if f.lower().endswith(image_extensions):
-                    full_path = os.path.join(root_dir, f)
-                    
-                    # Try to get hash from database first
-                    cur.execute("SELECT file_hash FROM photos WHERE path=?", (full_path,))
-                    row = cur.fetchone()
-                    
-                    if row and row[0]:
-                        file_hash = row[0]
-                    else:
-                        # Calculate hash if not in database
-                        file_hash = get_file_hash(full_path)
-                    
-                    if file_hash and file_hash in existing_hashes:
-                        new_info = get_file_info(full_path)
-                        existing_info = get_file_info(existing_hashes[file_hash])
-                        
-                        if new_info and existing_info:
-                            duplicates.append({
-                                'new': new_info,
-                                'existing': existing_info
-                            })
+        # Get path, hash, and thumbnail for new photos
+        cur.execute("""
+            SELECT path, file_hash, thumbnail FROM photos 
+            WHERE folder LIKE ? AND file_hash IS NOT NULL
+        """, (new_folder + '%',))
+        
+        new_photos = cur.fetchall()
+        print(f"DEBUG - Found {len(new_photos)} photos in new folder")
+        
+        if len(new_photos) == 0:
+            cur.execute("SELECT DISTINCT folder FROM photos LIMIT 5")
+            sample_folders = [row[0] for row in cur.fetchall()]
+            error_msg = f"No scanned photos found in new folder:\n{new_folder}\n\n"
+            error_msg += f"Sample folders in database:\n"
+            error_msg += "\n".join(sample_folders) if sample_folders else "(No folders found)"
+            error_msg += "\n\nPlease scan this folder first."
+            
+            self.root.after(0, lambda: self.dup_status_var.set("No photos found in new folder"))
+            self.root.after(0, lambda: messagebox.showwarning("No Photos Found", error_msg))
+            self.root.after(0, lambda: self.dup_scan_button.config(state='normal'))
+            conn.close()
+            return
+        
+        self.root.after(0, lambda: self.dup_status_var.set(f"Checking {len(new_photos)} photos for duplicates..."))
+        
+        # Build list of duplicate hashes first (fast) and store thumbnails
+        duplicate_hashes = {}
+        new_thumbnails = {}
+        
+        for path, file_hash, thumbnail in new_photos:
+            if thumbnail:
+                new_thumbnails[path] = thumbnail
+            if file_hash and file_hash in existing_hashes:
+                duplicate_hashes[path] = (file_hash, existing_hashes[file_hash])
+        
+        print(f"DEBUG - Found {len(duplicate_hashes)} duplicate hashes")
+        
+        # Get file info from database where possible to avoid slow os.stat() calls
+        self.root.after(0, lambda: self.dup_status_var.set(f"Getting file info for {len(duplicate_hashes)} duplicates..."))
+        
+        processed = 0
+        for new_path, (file_hash, existing_path) in duplicate_hashes.items():
+            processed += 1
+            self.root.after(0, lambda p=processed, t=len(duplicate_hashes): 
+                           self.dup_status_var.set(f"Getting file info ({p}/{t})..."))
+            
+            try:
+                # Try to get info quickly from os.stat (may be slow on OneDrive)
+                # Use simplified info - size can be estimated, date is less critical
+                try:
+                    new_stat = os.stat(new_path)
+                    new_size = new_stat.st_size
+                    new_modified = datetime.datetime.fromtimestamp(new_stat.st_mtime)
+                except:
+                    # If os.stat fails/hangs, use placeholder values
+                    new_size = 0
+                    new_modified = datetime.datetime.now()
+                
+                try:
+                    existing_stat = os.stat(existing_path)
+                    existing_size = existing_stat.st_size
+                    existing_modified = datetime.datetime.fromtimestamp(existing_stat.st_mtime)
+                except:
+                    existing_size = 0
+                    existing_modified = datetime.datetime.now()
+                
+                new_info = {
+                    'path': new_path,
+                    'size': new_size,
+                    'modified': new_modified,
+                    'size_mb': new_size / (1024 * 1024) if new_size > 0 else 0,
+                    'thumbnail': new_thumbnails.get(new_path)
+                }
+                
+                existing_info = {
+                    'path': existing_path,
+                    'size': existing_size,
+                    'modified': existing_modified,
+                    'size_mb': existing_size / (1024 * 1024) if existing_size > 0 else 0,
+                    'thumbnail': existing_thumbnails.get(existing_path)
+                }
+                
+                duplicates.append({
+                    'new': new_info,
+                    'existing': existing_info
+                })
+            except Exception as e:
+                print(f"Error getting file info: {e}")
         
         conn.close()
         
+        print(f"DEBUG - Returning {len(duplicates)} duplicates")
+        
         # Display results
+        self.root.after(0, lambda: self.dup_status_var.set(f"Loading thumbnails for {len(duplicates)} duplicate pairs..."))
         self.root.after(0, lambda: self._display_duplicates(duplicates))
     
     def _scan_duplicates_single(self, folder):
         """Scan for duplicate photos within a single folder"""
-        import hashlib
         import datetime
         
-        image_extensions = self.get_supported_image_extensions()
+        # Normalize path to use system separators
+        folder = os.path.normpath(folder)
         
-        def get_file_hash(filepath):
-            """Calculate MD5 hash of file"""
-            hash_md5 = hashlib.md5()
-            try:
-                with open(filepath, "rb") as f:
-                    for chunk in iter(lambda: f.read(4096), b""):
-                        hash_md5.update(chunk)
-                return hash_md5.hexdigest()
-            except:
-                return None
+        self.root.after(0, lambda: self.dup_status_var.set("Loading hashes from database..."))
         
-        def get_file_info(filepath):
-            """Get file metadata"""
-            try:
-                stat = os.stat(filepath)
-                mod_time = datetime.datetime.fromtimestamp(stat.st_mtime)
-                size = stat.st_size
-                return {
-                    'path': filepath,
-                    'size': size,
-                    'modified': mod_time,
-                    'size_mb': size / (1024 * 1024)
-                }
-            except:
-                return None
-        
-        self.root.after(0, lambda: self.dup_status_var.set("Scanning folder for duplicates..."))
-        
-        # Build hash dictionary for all photos in folder
-        hash_dict = {}  # hash -> list of file paths
+        # Get all photos in folder from database with their hashes
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
         
-        for root_dir, dirs, files in os.walk(folder):
-            for f in files:
-                if f.lower().endswith(image_extensions):
-                    full_path = os.path.join(root_dir, f)
-                    
-                    # Try to get hash from database first
-                    cur.execute("SELECT file_hash FROM photos WHERE path=?", (full_path,))
-                    row = cur.fetchone()
-                    
-                    if row and row[0]:
-                        file_hash = row[0]
-                    else:
-                        # Calculate hash if not in database
-                        file_hash = get_file_hash(full_path)
-                    
-                    if file_hash:
-                        if file_hash not in hash_dict:
-                            hash_dict[file_hash] = []
-                        hash_dict[file_hash].append(full_path)
+        cur.execute("""
+            SELECT path, file_hash, thumbnail FROM photos 
+            WHERE folder LIKE ? AND file_hash IS NOT NULL
+        """, (folder + '%',))
+        
+        # Build hash dictionary: hash -> list of (path, thumbnail) tuples
+        hash_dict = {}
+        for path, file_hash, thumbnail in cur.fetchall():
+            if file_hash:
+                if file_hash not in hash_dict:
+                    hash_dict[file_hash] = []
+                hash_dict[file_hash].append((path, thumbnail))
         
         conn.close()
         
-        # Find duplicates (hashes with more than one file)
-        self.root.after(0, lambda: self.dup_status_var.set("Identifying duplicates..."))
-        duplicates = []
+        self.root.after(0, lambda: self.dup_status_var.set(f"Loaded {len(hash_dict)} unique hashes from database"))
         
-        for file_hash, paths in hash_dict.items():
-            if len(paths) > 1:
+        # Find duplicates (hashes with more than one file) - in memory, very fast
+        self.root.after(0, lambda: self.dup_status_var.set("Identifying duplicates..."))
+        duplicate_groups = []
+        
+        for file_hash, path_thumb_list in hash_dict.items():
+            if len(path_thumb_list) > 1:
+                # Multiple files with same hash = duplicates
+                duplicate_groups.append(path_thumb_list)
+        
+        print(f"DEBUG - Found {len(duplicate_groups)} duplicate groups")
+        
+        # Now get file info only for duplicates
+        total_duplicates = sum(len(group) for group in duplicate_groups)
+        self.root.after(0, lambda: self.dup_status_var.set(f"Getting file info for {total_duplicates} duplicate photos..."))
+        
+        duplicates = []
+        processed = 0
+        
+        for file_hash, path_thumb_list in hash_dict.items():
+            if len(path_thumb_list) > 1:
                 # Multiple files with same hash = duplicates
                 # Treat first as "existing", rest as "new" (to delete)
-                existing_path = paths[0]
-                existing_info = get_file_info(existing_path)
+                existing_path, existing_thumbnail = path_thumb_list[0]
+            
+                processed += 1
+                self.root.after(0, lambda p=processed, t=total_duplicates: 
+                               self.dup_status_var.set(f"Getting file info ({p}/{t})..."))
+            
+                try:
+                    existing_stat = os.stat(existing_path)
+                    existing_info = {
+                        'path': existing_path,
+                        'size': existing_stat.st_size,
+                        'modified': datetime.datetime.fromtimestamp(existing_stat.st_mtime),
+                        'size_mb': existing_stat.st_size / (1024 * 1024),
+                        'thumbnail': existing_thumbnail
+                    }
+                except:
+                    existing_info = {
+                        'path': existing_path,
+                        'size': 0,
+                        'modified': datetime.datetime.now(),
+                        'size_mb': 0,
+                        'thumbnail': existing_thumbnail
+                    }
+            
+                for dup_path, dup_thumbnail in path_thumb_list[1:]:
+                    processed += 1
+                    self.root.after(0, lambda p=processed, t=total_duplicates: 
+                                   self.dup_status_var.set(f"Getting file info ({p}/{t})..."))
                 
-                for dup_path in paths[1:]:
-                    dup_info = get_file_info(dup_path)
+                    try:
+                        dup_stat = os.stat(dup_path)
+                        dup_info = {
+                            'path': dup_path,
+                            'size': dup_stat.st_size,
+                            'modified': datetime.datetime.fromtimestamp(dup_stat.st_mtime),
+                            'size_mb': dup_stat.st_size / (1024 * 1024),
+                            'thumbnail': dup_thumbnail
+                        }
+                    except:
+                        dup_info = {
+                            'path': dup_path,
+                            'size': 0,
+                            'modified': datetime.datetime.now(),
+                            'size_mb': 0,
+                            'thumbnail': dup_thumbnail
+                        }
+                
                     if existing_info and dup_info:
                         duplicates.append({
                             'new': dup_info,
                             'existing': existing_info
                         })
         
+        print(f"DEBUG - Returning {len(duplicates)} duplicate pairs")
+        
         # Display results
+        self.root.after(0, lambda: self.dup_status_var.set(f"Loading thumbnails for {len(duplicates)} duplicate pairs..."))
         self.root.after(0, lambda: self._display_duplicates(duplicates))
     
     def _display_duplicates(self, duplicates):
@@ -1803,30 +1874,43 @@ class PhotoOrganizer:
         
         self.dup_status_var.set(f"Found {len(duplicates)} duplicate(s)")
         
+        # Determine mode for header labels
+        mode = self.dup_mode_var.get()
+        
         # Header
         header_frame = ttk.Frame(self.dup_results_frame)
         header_frame.pack(fill=tk.X, pady=(0, 10))
         
-        ttk.Label(header_frame, text="Delete?", font=('Arial', 10, 'bold')).grid(row=0, column=0, padx=5)
-        ttk.Label(header_frame, text="New Photo", font=('Arial', 10, 'bold')).grid(row=0, column=1, padx=20)
-        ttk.Label(header_frame, text="", font=('Arial', 10, 'bold')).grid(row=0, column=2, padx=20)
-        ttk.Label(header_frame, text="Existing Photo", font=('Arial', 10, 'bold')).grid(row=0, column=3, padx=20)
+        if mode == "single":
+            ttk.Label(header_frame, text="Delete?", font=('Arial', 10, 'bold')).grid(row=0, column=0, padx=5)
+            ttk.Label(header_frame, text="Photo 1", font=('Arial', 10, 'bold')).grid(row=0, column=1, padx=20)
+            ttk.Label(header_frame, text="", font=('Arial', 10, 'bold')).grid(row=0, column=2, padx=20)
+            ttk.Label(header_frame, text="Delete?", font=('Arial', 10, 'bold')).grid(row=0, column=3, padx=5)
+            ttk.Label(header_frame, text="Photo 2", font=('Arial', 10, 'bold')).grid(row=0, column=4, padx=20)
+        else:
+            ttk.Label(header_frame, text="Delete?", font=('Arial', 10, 'bold')).grid(row=0, column=0, padx=5)
+            ttk.Label(header_frame, text="New Photo", font=('Arial', 10, 'bold')).grid(row=0, column=1, padx=20)
+            ttk.Label(header_frame, text="", font=('Arial', 10, 'bold')).grid(row=0, column=2, padx=20)
+            ttk.Label(header_frame, text="Existing Photo", font=('Arial', 10, 'bold')).grid(row=0, column=3, padx=20)
         
         ttk.Separator(self.dup_results_frame, orient='horizontal').pack(fill=tk.X, pady=5)
         
         # Display each duplicate pair
         for idx, dup in enumerate(duplicates):
-            self._create_duplicate_row(idx, dup)
+            if mode == "single":
+                self._create_duplicate_row_single(idx, dup)
+            else:
+                self._create_duplicate_row_compare(idx, dup)
         
         self.dup_scan_button.config(state='normal')
         self.dup_delete_button.config(state='normal')
     
-    def _create_duplicate_row(self, idx, dup):
-        """Create a row showing a duplicate pair"""
+    def _create_duplicate_row_compare(self, idx, dup):
+        """Create a row showing a duplicate pair for compare mode"""
         row_frame = ttk.Frame(self.dup_results_frame)
         row_frame.pack(fill=tk.X, pady=10, padx=5)
         
-        # Checkbox for deletion
+        # Checkbox for deletion (new photo side only)
         delete_var = tk.BooleanVar(value=True)  # Default to checked
         checkbox = ttk.Checkbutton(row_frame, variable=delete_var)
         checkbox.grid(row=0, column=0, padx=5, sticky='n')
@@ -1842,9 +1926,15 @@ class PhotoOrganizer:
         
         # Try to load thumbnail
         try:
-            img = Image.open(dup['new']['path'])
-            img = ImageOps.exif_transpose(img)
-            img.thumbnail((150, 150))
+            # Use thumbnail from database if available
+            if dup['new'].get('thumbnail'):
+                img = Image.open(io.BytesIO(dup['new']['thumbnail']))
+            else:
+                # Fallback to loading from file
+                img = Image.open(dup['new']['path'])
+                img = ImageOps.exif_transpose(img)
+                img.thumbnail((150, 150))
+            
             photo = ImageTk.PhotoImage(img)
             lbl = ttk.Label(new_frame, image=photo)
             lbl.image = photo  # Keep reference
@@ -1860,15 +1950,21 @@ class PhotoOrganizer:
         # Arrow/equals sign
         ttk.Label(row_frame, text="=", font=('Arial', 20)).grid(row=0, column=2, padx=10)
         
-        # Existing photo info
+        # Existing photo info (no checkbox)
         existing_frame = ttk.Frame(row_frame, relief='solid', borderwidth=1)
         existing_frame.grid(row=0, column=3, padx=10, sticky='nsew')
         
         # Try to load thumbnail
         try:
-            img = Image.open(dup['existing']['path'])
-            img = ImageOps.exif_transpose(img)
-            img.thumbnail((150, 150))
+            # Use thumbnail from database if available
+            if dup['existing'].get('thumbnail'):
+                img = Image.open(io.BytesIO(dup['existing']['thumbnail']))
+            else:
+                # Fallback to loading from file
+                img = Image.open(dup['existing']['path'])
+                img = ImageOps.exif_transpose(img)
+                img.thumbnail((150, 150))
+            
             photo = ImageTk.PhotoImage(img)
             lbl = ttk.Label(existing_frame, image=photo)
             lbl.image = photo  # Keep reference
@@ -1884,9 +1980,152 @@ class PhotoOrganizer:
         # Separator
         ttk.Separator(self.dup_results_frame, orient='horizontal').pack(fill=tk.X, pady=10)
     
+    def _create_duplicate_row_single(self, idx, dup):
+        """Create a row showing a duplicate pair for single folder mode with checkboxes on both sides"""
+        row_frame = ttk.Frame(self.dup_results_frame)
+        row_frame.pack(fill=tk.X, pady=10, padx=5)
+        
+        # Radio button variable to track which photo to keep (shared between both photos)
+        keep_var = tk.StringVar(value="existing")  # Default keep first photo
+        
+        # Checkbox and Photo 1 (existing/first)
+        delete_existing_var = tk.BooleanVar(value=False)  # Default NOT checked
+        
+        # Link radio button to checkbox
+        def update_existing_checkbox():
+            delete_existing_var.set(keep_var.get() == "new")
+        
+        checkbox1_frame = ttk.Frame(row_frame)
+        checkbox1_frame.grid(row=0, column=0, padx=5, sticky='n')
+        
+        ttk.Radiobutton(checkbox1_frame, variable=keep_var, value="existing", 
+                       command=update_existing_checkbox).pack()
+        checkbox1 = ttk.Checkbutton(checkbox1_frame, variable=delete_existing_var, state='disabled')
+        checkbox1.pack()
+        
+        # Photo 1 info
+        photo1_frame = ttk.Frame(row_frame, relief='solid', borderwidth=1)
+        photo1_frame.grid(row=0, column=1, padx=10, sticky='nsew')
+        
+        # Try to load thumbnail
+        try:
+            # Use thumbnail from database if available
+            if dup['existing'].get('thumbnail'):
+                img = Image.open(io.BytesIO(dup['existing']['thumbnail']))
+            else:
+                # Fallback to loading from file
+                img = Image.open(dup['existing']['path'])
+                img = ImageOps.exif_transpose(img)
+                img.thumbnail((150, 150))
+            
+            photo = ImageTk.PhotoImage(img)
+            lbl = ttk.Label(photo1_frame, image=photo)
+            lbl.image = photo
+            lbl.pack(pady=5)
+        except:
+            ttk.Label(photo1_frame, text="[Image]", width=20).pack(pady=5)
+        
+        ttk.Label(photo1_frame, text=f"File: {os.path.basename(dup['existing']['path'])}", 
+                 wraplength=200).pack()
+        ttk.Label(photo1_frame, text=f"Size: {dup['existing']['size_mb']:.2f} MB").pack()
+        ttk.Label(photo1_frame, text=f"Modified: {dup['existing']['modified'].strftime('%Y-%m-%d %H:%M')}").pack()
+        
+        # Show path with right-aligned text
+        path_text = dup['existing']['path']
+        if len(path_text) > 40:
+            path_text = "..." + path_text[-40:]
+        ttk.Label(photo1_frame, text=f"Path: {path_text}", 
+                 wraplength=200, font=('Arial', 8), anchor='e').pack(pady=(5,5))
+        
+        # Arrow/equals sign
+        ttk.Label(row_frame, text="=", font=('Arial', 20)).grid(row=0, column=2, padx=10)
+        
+        # Checkbox and Photo 2 (new/second)
+        delete_new_var = tk.BooleanVar(value=True)  # Default checked
+        
+        # Link radio button to checkbox
+        def update_new_checkbox():
+            delete_new_var.set(keep_var.get() == "existing")
+        
+        checkbox2_frame = ttk.Frame(row_frame)
+        checkbox2_frame.grid(row=0, column=3, padx=5, sticky='n')
+        
+        ttk.Radiobutton(checkbox2_frame, variable=keep_var, value="new", 
+                       command=update_new_checkbox).pack()
+        checkbox2 = ttk.Checkbutton(checkbox2_frame, variable=delete_new_var, state='disabled')
+        checkbox2.pack()
+        
+        # Photo 2 info
+        photo2_frame = ttk.Frame(row_frame, relief='solid', borderwidth=1)
+        photo2_frame.grid(row=0, column=4, padx=10, sticky='nsew')
+        
+        # Try to load thumbnail
+        try:
+            # Use thumbnail from database if available
+            if dup['new'].get('thumbnail'):
+                img = Image.open(io.BytesIO(dup['new']['thumbnail']))
+            else:
+                # Fallback to loading from file
+                img = Image.open(dup['new']['path'])
+                img = ImageOps.exif_transpose(img)
+                img.thumbnail((150, 150))
+            
+            photo = ImageTk.PhotoImage(img)
+            lbl = ttk.Label(photo2_frame, image=photo)
+            lbl.image = photo
+            lbl.pack(pady=5)
+        except:
+            ttk.Label(photo2_frame, text="[Image]", width=20).pack(pady=5)
+        
+        ttk.Label(photo2_frame, text=f"File: {os.path.basename(dup['new']['path'])}", 
+                 wraplength=200).pack()
+        ttk.Label(photo2_frame, text=f"Size: {dup['new']['size_mb']:.2f} MB").pack()
+        ttk.Label(photo2_frame, text=f"Modified: {dup['new']['modified'].strftime('%Y-%m-%d %H:%M')}").pack()
+        
+        # Show path with right-aligned text
+        path_text = dup['new']['path']
+        if len(path_text) > 40:
+            path_text = "..." + path_text[-40:]
+        ttk.Label(photo2_frame, text=f"Path: {path_text}", 
+                 wraplength=200, font=('Arial', 8), anchor='e').pack(pady=(5,5))
+        
+        # Store which photo to delete based on radio button selection
+        # We need to check the keep_var when deletion happens
+        self.dup_checkboxes.append({
+            'var': delete_existing_var,
+            'path': dup['existing']['path'],
+            'keep_var': keep_var,
+            'keep_value': 'new'  # Delete this if 'new' is selected
+        })
+        
+        self.dup_checkboxes.append({
+            'var': delete_new_var,
+            'path': dup['new']['path'],
+            'keep_var': keep_var,
+            'keep_value': 'existing'  # Delete this if 'existing' is selected
+        })
+        
+        # Initialize checkbox states
+        update_existing_checkbox()
+        update_new_checkbox()
+        
+        # Separator
+        ttk.Separator(self.dup_results_frame, orient='horizontal').pack(fill=tk.X, pady=10)
+    
     def delete_selected_duplicates(self):
         """Delete all checked duplicate photos after confirmation"""
-        to_delete = [item['path'] for item in self.dup_checkboxes if item['var'].get()]
+        to_delete = []
+        
+        for item in self.dup_checkboxes:
+            # Check if this is from single folder mode (has keep_var)
+            if 'keep_var' in item:
+                # Delete if the keep_var is set to the OTHER photo
+                if item['keep_var'].get() == item['keep_value']:
+                    to_delete.append(item['path'])
+            else:
+                # Compare mode - use checkbox directly
+                if item['var'].get():
+                    to_delete.append(item['path'])
         
         if not to_delete:
             messagebox.showinfo("No Selection", "No photos selected for deletion.")
