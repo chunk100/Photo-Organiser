@@ -38,6 +38,9 @@ class PhotoOrganizer:
         self.current_image_index = 0
         self.thumb_refs = {}
         self.thumbs = []
+        
+        # Flag to track if scan should be cancelled
+        self.scan_cancelled = False
 
         self.setup_ui()
         
@@ -226,7 +229,10 @@ class PhotoOrganizer:
 
         bottom_frame = ttk.Frame(self.root)
         bottom_frame.pack(fill=tk.X)
-        ttk.Button(bottom_frame, text="Rescan Current Folder", command=self.rescan_current_folder).pack(side=tk.LEFT, padx=5, pady=5)
+        self.rescan_button = ttk.Button(bottom_frame, text="Rescan Current Folder", command=self.rescan_current_folder)
+        self.rescan_button.pack(side=tk.LEFT, padx=5, pady=5)
+        self.cancel_scan_button = ttk.Button(bottom_frame, text="Cancel Scan", command=self.cancel_scan, state='disabled')
+        self.cancel_scan_button.pack(side=tk.LEFT, padx=5, pady=5)
 
         self.status_frame = ttk.Frame(self.root)
         self.status_frame.pack(fill=tk.X, side=tk.BOTTOM)
@@ -236,6 +242,26 @@ class PhotoOrganizer:
         self.status_bar.pack(fill=tk.X, side=tk.TOP)
         self.status_scroll.config(command=self.status_bar.xview)
         self.status_bar.configure(state='disabled')
+
+    def cancel_scan(self):
+        """Cancel the current scan operation"""
+        self.scan_cancelled = True
+        self.set_status("Cancelling scan...")
+        self.cancel_scan_button.config(state='disabled')
+
+    def rescan_current_folder(self):
+        # Rescan only the currently selected folder and its subfolders
+        if self.current_folder and os.path.isdir(self.current_folder):
+            self.set_status(f"Starting rescan of {self.current_folder}...")
+            # Reset the cancel flag when starting a new scan
+            self.scan_cancelled = False
+            # Enable the cancel button
+            self.cancel_scan_button.config(state='normal')
+            # Disable the rescan button to prevent multiple scans
+            self.rescan_button.config(state='disabled')
+            threading.Thread(target=self.scan_and_store_thumbnails_with_stats, args=(self.current_folder,), daemon=True).start()
+        else:
+            messagebox.showwarning("No Folder Selected", "Please select a folder in the tree view to rescan.")
 
     def set_status(self, message):
         def _update():
@@ -335,15 +361,6 @@ class PhotoOrganizer:
         
         threading.Thread(target=self.load_thumbnails_from_db, args=(path,), daemon=True).start()
 
-    def rescan_current_folder(self):
-        # Rescan only the currently selected folder and its subfolders
-        if self.current_folder and os.path.isdir(self.current_folder):
-            self.set_status(f"Starting rescan of {self.current_folder}...")
-            threading.Thread(target=self.scan_and_store_thumbnails_with_stats, args=(self.current_folder,), daemon=True).start()
-        else:
-            messagebox.showwarning("No Folder Selected", "Please select a folder in the tree view to rescan.")
-
-
     def scan_and_store_thumbnails_with_stats(self, folder):
         """Scan and store thumbnails with summary statistics at the end"""
         import hashlib
@@ -367,7 +384,25 @@ class PhotoOrganizer:
         errors = 0
         
         for root_dir, dirs, files in os.walk(folder):
+            # Check if scan was cancelled
+            if self.scan_cancelled:
+                self.set_status(f"Scan cancelled. Processed {processed}/{total} files before cancellation.")
+                conn.close()
+                # Re-enable buttons
+                self.root.after(0, lambda: self.rescan_button.config(state='normal'))
+                self.root.after(0, lambda: self.cancel_scan_button.config(state='disabled'))
+                return
+                
             for f in files:
+                # Check if scan was cancelled
+                if self.scan_cancelled:
+                    self.set_status(f"Scan cancelled. Processed {processed}/{total} files before cancellation.")
+                    conn.close()
+                    # Re-enable buttons
+                    self.root.after(0, lambda: self.rescan_button.config(state='normal'))
+                    self.root.after(0, lambda: self.cancel_scan_button.config(state='disabled'))
+                    return
+                    
                 if f.lower().endswith(image_extensions):
                     full_path = os.path.join(root_dir, f)
                     
@@ -415,25 +450,33 @@ class PhotoOrganizer:
 
         conn.commit()
 
-        self.set_status("Running cleanup and database optimization...")
-        deleted = self.cleanup_orphan_thumbnails()
-        self.vacuum_db()
+        # Only do cleanup if scan wasn't cancelled
+        if not self.scan_cancelled:
+            self.set_status("Running cleanup and database optimization...")
+            deleted = self.cleanup_orphan_thumbnails()
+            self.vacuum_db()
+            
+            conn.close()
+            
+            # Build summary status message
+            status_msg = f"Rescan complete: {new_files} new files"
+            if orientations_corrected > 0:
+                status_msg += f" | {orientations_corrected} orientations corrected"
+            if errors > 0:
+                status_msg += f" | {errors} errors"
+            if deleted > 0:
+                status_msg += f" | {deleted} removed"
+            
+            self.set_status(status_msg)
+            
+            # Reload thumbnails for current folder
+            self.root.after(0, lambda: self.load_thumbnails_from_db(folder))
+        else:
+            conn.close()
         
-        conn.close()
-        
-        # Build summary status message
-        status_msg = f"Rescan complete: {new_files} new files"
-        if orientations_corrected > 0:
-            status_msg += f" | {orientations_corrected} orientations corrected"
-        if errors > 0:
-            status_msg += f" | {errors} errors"
-        if deleted > 0:
-            status_msg += f" | {deleted} removed"
-        
-        self.set_status(status_msg)
-        
-        # Reload thumbnails for current folder
-        self.root.after(0, lambda: self.load_thumbnails_from_db(folder))
+        # Re-enable buttons
+        self.root.after(0, lambda: self.rescan_button.config(state='normal'))
+        self.root.after(0, lambda: self.cancel_scan_button.config(state='disabled'))
 
     def scan_and_store_thumbnails(self, folder):
         self.set_status(f"Scanning and storing thumbnails: {folder}...")
@@ -1625,8 +1668,6 @@ class PhotoOrganizer:
                 if thumbnail:
                     existing_thumbnails[path] = thumbnail
         
-        print(f"DEBUG - Found {len(existing_hashes)} photos in existing folder")
-        
         if len(existing_hashes) == 0:
             cur.execute("SELECT DISTINCT folder FROM photos LIMIT 5")
             sample_folders = [row[0] for row in cur.fetchall()]
@@ -1647,8 +1688,6 @@ class PhotoOrganizer:
         self.root.after(0, lambda: self.dup_status_var.set("Checking new photos for duplicates..."))
         duplicates = []
         
-        print(f"DEBUG - Looking for new folder: {new_folder}")
-        
         # Get path, hash, and thumbnail for new photos
         cur.execute("""
             SELECT path, file_hash, thumbnail FROM photos 
@@ -1656,7 +1695,6 @@ class PhotoOrganizer:
         """, (new_folder + '%',))
         
         new_photos = cur.fetchall()
-        print(f"DEBUG - Found {len(new_photos)} photos in new folder")
         
         if len(new_photos) == 0:
             cur.execute("SELECT DISTINCT folder FROM photos LIMIT 5")
@@ -1684,9 +1722,7 @@ class PhotoOrganizer:
             if file_hash and file_hash in existing_hashes:
                 duplicate_hashes[path] = (file_hash, existing_hashes[file_hash])
         
-        print(f"DEBUG - Found {len(duplicate_hashes)} duplicate hashes")
-        
-        # Get file info from database where possible to avoid slow os.stat() calls
+        # Get file info from database where possible
         self.root.after(0, lambda: self.dup_status_var.set(f"Getting file info for {len(duplicate_hashes)} duplicates..."))
         
         processed = 0
@@ -1696,14 +1732,12 @@ class PhotoOrganizer:
                            self.dup_status_var.set(f"Getting file info ({p}/{t})..."))
             
             try:
-                # Try to get info quickly from os.stat (may be slow on OneDrive)
-                # Use simplified info - size can be estimated, date is less critical
+                # Try to get info quickly from os.stat
                 try:
                     new_stat = os.stat(new_path)
                     new_size = new_stat.st_size
                     new_modified = datetime.datetime.fromtimestamp(new_stat.st_mtime)
                 except:
-                    # If os.stat fails/hangs, use placeholder values
                     new_size = 0
                     new_modified = datetime.datetime.now()
                 
@@ -1739,8 +1773,6 @@ class PhotoOrganizer:
                 print(f"Error getting file info: {e}")
         
         conn.close()
-        
-        print(f"DEBUG - Returning {len(duplicates)} duplicates")
         
         # Display results
         self.root.after(0, lambda: self.dup_status_var.set(f"Loading thumbnails for {len(duplicates)} duplicate pairs..."))
@@ -1784,8 +1816,6 @@ class PhotoOrganizer:
             if len(path_thumb_list) > 1:
                 # Multiple files with same hash = duplicates
                 duplicate_groups.append(path_thumb_list)
-        
-        print(f"DEBUG - Found {len(duplicate_groups)} duplicate groups")
         
         # Now get file info only for duplicates
         total_duplicates = sum(len(group) for group in duplicate_groups)
@@ -1850,8 +1880,6 @@ class PhotoOrganizer:
                             'new': dup_info,
                             'existing': existing_info
                         })
-        
-        print(f"DEBUG - Returning {len(duplicates)} duplicate pairs")
         
         # Display results
         self.root.after(0, lambda: self.dup_status_var.set(f"Loading thumbnails for {len(duplicates)} duplicate pairs..."))
@@ -2090,7 +2118,6 @@ class PhotoOrganizer:
                  wraplength=200, font=('Arial', 8), anchor='e').pack(pady=(5,5))
         
         # Store which photo to delete based on radio button selection
-        # We need to check the keep_var when deletion happens
         self.dup_checkboxes.append({
             'var': delete_existing_var,
             'path': dup['existing']['path'],
