@@ -2008,136 +2008,110 @@ class PhotoOrganizer:
         # Separator
         ttk.Separator(self.dup_results_frame, orient='horizontal').pack(fill=tk.X, pady=10)
     
+
     def _create_duplicate_row_single(self, idx, dup):
-        """Create a row showing a duplicate pair for single folder mode with checkboxes on both sides"""
-        row_frame = ttk.Frame(self.dup_results_frame)
-        row_frame.pack(fill=tk.X, pady=10, padx=5)
-        
-        # Radio button variable to track which photo to keep (shared between both photos)
-        keep_var = tk.StringVar(value="existing")  # Default keep first photo
-        
-        # Checkbox and Photo 1 (existing/first)
-        delete_existing_var = tk.BooleanVar(value=False)  # Default NOT checked
-        
-        # Link radio button to checkbox
-        def update_existing_checkbox():
-            delete_existing_var.set(keep_var.get() == "new")
-        
-        checkbox1_frame = ttk.Frame(row_frame)
-        checkbox1_frame.grid(row=0, column=0, padx=5, sticky='n')
-        
-        ttk.Radiobutton(checkbox1_frame, variable=keep_var, value="existing", 
-                       command=update_existing_checkbox).pack()
-        checkbox1 = ttk.Checkbutton(checkbox1_frame, variable=delete_existing_var, state='disabled')
-        checkbox1.pack()
-        
-        # Photo 1 info
-        photo1_frame = ttk.Frame(row_frame, relief='solid', borderwidth=1)
-        photo1_frame.grid(row=0, column=1, padx=10, sticky='nsew')
-        
-        # Try to load thumbnail
-        try:
-            # Use thumbnail from database if available
-            if dup['existing'].get('thumbnail'):
-                img = Image.open(io.BytesIO(dup['existing']['thumbnail']))
-            else:
-                # Fallback to loading from file
-                img = Image.open(dup['existing']['path'])
-                img = ImageOps.exif_transpose(img)
-                img.thumbnail((150, 150))
+            """Create a row showing a duplicate pair for single folder mode with radio buttons"""
+            row_frame = ttk.Frame(self.dup_results_frame)
+            row_frame.pack(fill=tk.X, pady=10, padx=5)
             
-            photo = ImageTk.PhotoImage(img)
-            lbl = ttk.Label(photo1_frame, image=photo)
-            lbl.image = photo
-            lbl.pack(pady=5)
-        except:
-            ttk.Label(photo1_frame, text="[Image]", width=20).pack(pady=5)
-        
-        ttk.Label(photo1_frame, text=f"File: {os.path.basename(dup['existing']['path'])}", 
-                 wraplength=200).pack()
-        ttk.Label(photo1_frame, text=f"Size: {dup['existing']['size_mb']:.2f} MB").pack()
-        ttk.Label(photo1_frame, text=f"Modified: {dup['existing']['modified'].strftime('%Y-%m-%d %H:%M')}").pack()
-        
-        # Show path with right-aligned text
-        path_text = dup['existing']['path']
-        if len(path_text) > 40:
-            path_text = "..." + path_text[-40:]
-        ttk.Label(photo1_frame, text=f"Path: {path_text}", 
-                 wraplength=200, font=('Arial', 8), anchor='e').pack(pady=(5,5))
-        
-        # Arrow/equals sign
-        ttk.Label(row_frame, text="=", font=('Arial', 20)).grid(row=0, column=2, padx=10)
-        
-        # Checkbox and Photo 2 (new/second)
-        delete_new_var = tk.BooleanVar(value=True)  # Default checked
-        
-        # Link radio button to checkbox
-        def update_new_checkbox():
-            delete_new_var.set(keep_var.get() == "existing")
-        
-        checkbox2_frame = ttk.Frame(row_frame)
-        checkbox2_frame.grid(row=0, column=3, padx=5, sticky='n')
-        
-        ttk.Radiobutton(checkbox2_frame, variable=keep_var, value="new", 
-                       command=update_new_checkbox).pack()
-        checkbox2 = ttk.Checkbutton(checkbox2_frame, variable=delete_new_var, state='disabled')
-        checkbox2.pack()
-        
-        # Photo 2 info
-        photo2_frame = ttk.Frame(row_frame, relief='solid', borderwidth=1)
-        photo2_frame.grid(row=0, column=4, padx=10, sticky='nsew')
-        
-        # Try to load thumbnail
-        try:
-            # Use thumbnail from database if available
-            if dup['new'].get('thumbnail'):
-                img = Image.open(io.BytesIO(dup['new']['thumbnail']))
-            else:
-                # Fallback to loading from file
-                img = Image.open(dup['new']['path'])
-                img = ImageOps.exif_transpose(img)
-                img.thumbnail((150, 150))
+            # Radio button variable to track which photo to keep (shared between both photos)
+            keep_var = tk.StringVar(value="existing")  # Default keep first photo (delete second)
             
-            photo = ImageTk.PhotoImage(img)
-            lbl = ttk.Label(photo2_frame, image=photo)
-            lbl.image = photo
-            lbl.pack(pady=5)
-        except:
-            ttk.Label(photo2_frame, text="[Image]", width=20).pack(pady=5)
-        
-        ttk.Label(photo2_frame, text=f"File: {os.path.basename(dup['new']['path'])}", 
-                 wraplength=200).pack()
-        ttk.Label(photo2_frame, text=f"Size: {dup['new']['size_mb']:.2f} MB").pack()
-        ttk.Label(photo2_frame, text=f"Modified: {dup['new']['modified'].strftime('%Y-%m-%d %H:%M')}").pack()
-        
-        # Show path with right-aligned text
-        path_text = dup['new']['path']
-        if len(path_text) > 40:
-            path_text = "..." + path_text[-40:]
-        ttk.Label(photo2_frame, text=f"Path: {path_text}", 
-                 wraplength=200, font=('Arial', 8), anchor='e').pack(pady=(5,5))
-        
-        # Store which photo to delete based on radio button selection
-        self.dup_checkboxes.append({
-            'var': delete_existing_var,
-            'path': dup['existing']['path'],
-            'keep_var': keep_var,
-            'keep_value': 'new'  # Delete this if 'new' is selected
-        })
-        
-        self.dup_checkboxes.append({
-            'var': delete_new_var,
-            'path': dup['new']['path'],
-            'keep_var': keep_var,
-            'keep_value': 'existing'  # Delete this if 'existing' is selected
-        })
-        
-        # Initialize checkbox states
-        update_existing_checkbox()
-        update_new_checkbox()
-        
-        # Separator
-        ttk.Separator(self.dup_results_frame, orient='horizontal').pack(fill=tk.X, pady=10)
+            # Radio button for Photo 1 (existing/first)
+            checkbox1_frame = ttk.Frame(row_frame)
+            checkbox1_frame.grid(row=0, column=0, padx=5, sticky='n')
+            
+            ttk.Radiobutton(checkbox1_frame, text="Keep", variable=keep_var, value="existing").pack()
+            
+            # Photo 1 info
+            photo1_frame = ttk.Frame(row_frame, relief='solid', borderwidth=1)
+            photo1_frame.grid(row=0, column=1, padx=10, sticky='nsew')
+            
+            # Try to load thumbnail
+            try:
+                if dup['existing'].get('thumbnail'):
+                    img = Image.open(io.BytesIO(dup['existing']['thumbnail']))
+                else:
+                    img = Image.open(dup['existing']['path'])
+                    img = ImageOps.exif_transpose(img)
+                    img.thumbnail((150, 150))
+                
+                photo = ImageTk.PhotoImage(img)
+                lbl = ttk.Label(photo1_frame, image=photo)
+                lbl.image = photo
+                lbl.pack(pady=5)
+            except:
+                ttk.Label(photo1_frame, text="[Image]", width=20).pack(pady=5)
+            
+            ttk.Label(photo1_frame, text=f"File: {os.path.basename(dup['existing']['path'])}", 
+                     wraplength=200).pack()
+            ttk.Label(photo1_frame, text=f"Size: {dup['existing']['size_mb']:.2f} MB").pack()
+            ttk.Label(photo1_frame, text=f"Modified: {dup['existing']['modified'].strftime('%Y-%m-%d %H:%M')}").pack()
+            
+            path_text = dup['existing']['path']
+            if len(path_text) > 40:
+                path_text = "..." + path_text[-40:]
+            ttk.Label(photo1_frame, text=f"Path: {path_text}", 
+                     wraplength=200, font=('Arial', 8), anchor='e').pack(pady=(5,5))
+            
+            # Arrow/equals sign
+            ttk.Label(row_frame, text="=", font=('Arial', 20)).grid(row=0, column=2, padx=10)
+            
+            # Radio button for Photo 2 (new/second)
+            checkbox2_frame = ttk.Frame(row_frame)
+            checkbox2_frame.grid(row=0, column=3, padx=5, sticky='n')
+            
+            ttk.Radiobutton(checkbox2_frame, text="Keep", variable=keep_var, value="new").pack()
+            
+            # Photo 2 info
+            photo2_frame = ttk.Frame(row_frame, relief='solid', borderwidth=1)
+            photo2_frame.grid(row=0, column=4, padx=10, sticky='nsew')
+            
+            # Try to load thumbnail
+            try:
+                if dup['new'].get('thumbnail'):
+                    img = Image.open(io.BytesIO(dup['new']['thumbnail']))
+                else:
+                    img = Image.open(dup['new']['path'])
+                    img = ImageOps.exif_transpose(img)
+                    img.thumbnail((150, 150))
+                
+                photo = ImageTk.PhotoImage(img)
+                lbl = ttk.Label(photo2_frame, image=photo)
+                lbl.image = photo
+                lbl.pack(pady=5)
+            except:
+                ttk.Label(photo2_frame, text="[Image]", width=20).pack(pady=5)
+            
+            ttk.Label(photo2_frame, text=f"File: {os.path.basename(dup['new']['path'])}", 
+                     wraplength=200).pack()
+            ttk.Label(photo2_frame, text=f"Size: {dup['new']['size_mb']:.2f} MB").pack()
+            ttk.Label(photo2_frame, text=f"Modified: {dup['new']['modified'].strftime('%Y-%m-%d %H:%M')}").pack()
+            
+            path_text = dup['new']['path']
+            if len(path_text) > 40:
+                path_text = "..." + path_text[-40:]
+            ttk.Label(photo2_frame, text=f"Path: {path_text}", 
+                     wraplength=200, font=('Arial', 8), anchor='e').pack(pady=(5,5))
+            
+            # Store both photos with reference to the shared keep_var
+            # When keep_var == "existing", delete the "new" photo
+            # When keep_var == "new", delete the "existing" photo
+            self.dup_checkboxes.append({
+                'path': dup['new']['path'],
+                'keep_var': keep_var,
+                'keep_value': 'existing'  # Delete this path if 'existing' is selected (keep existing)
+            })
+            
+            self.dup_checkboxes.append({
+                'path': dup['existing']['path'],
+                'keep_var': keep_var,
+                'keep_value': 'new'  # Delete this path if 'new' is selected (keep new)
+            })
+            
+            # Separator
+            ttk.Separator(self.dup_results_frame, orient='horizontal').pack(fill=tk.X, pady=10)
+
     
     def delete_selected_duplicates(self):
         """Delete all checked duplicate photos after confirmation"""
@@ -2147,6 +2121,7 @@ class PhotoOrganizer:
             # Check if this is from single folder mode (has keep_var)
             if 'keep_var' in item:
                 # Delete if the keep_var is set to the OTHER photo
+                # item['keep_value'] is the value that means THIS photo should be deleted
                 if item['keep_var'].get() == item['keep_value']:
                     to_delete.append(item['path'])
             else:
@@ -2158,11 +2133,17 @@ class PhotoOrganizer:
             messagebox.showinfo("No Selection", "No photos selected for deletion.")
             return
         
+        # Show which files will be deleted
+        file_list = "\n".join([os.path.basename(p) for p in to_delete[:10]])
+        if len(to_delete) > 10:
+            file_list += f"\n... and {len(to_delete) - 10} more"
+        
         # Confirmation dialog
         result = messagebox.askyesno(
             "Confirm Deletion",
             f"⚠️ WARNING ⚠️\n\n"
-            f"You are about to permanently delete {len(to_delete)} photo(s).\n\n"
+            f"You are about to permanently delete {len(to_delete)} photo(s):\n\n"
+            f"{file_list}\n\n"
             f"This action CANNOT be undone!\n\n"
             f"Are you sure you want to continue?",
             icon='warning'
@@ -2214,8 +2195,9 @@ class PhotoOrganizer:
         if deleted > 0:
             self.set_status(f"Updating database after deleting {deleted} duplicate(s)...")
             threading.Thread(target=self._rescan_after_deletion, 
-                           args=(affected_folders,), daemon=True).start()
-    
+                           args=(affected_folders,), daemon=True).start() 
+ 
+     
     def _rescan_after_deletion(self, affected_folders):
         """Rescan folders after deletion to update the database"""
         # Run cleanup to remove deleted photos from database
