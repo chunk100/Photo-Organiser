@@ -87,6 +87,31 @@ class PhotoOrganizer:
         
         return tuple(extensions)
 
+
+    def get_supported_video_extensions(self):
+        """Returns a tuple of supported video extensions"""
+        return (
+            # Common formats
+            '.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.m4v', '.mpg', '.mpeg', 
+            '.3gp', '.webm', '.ogv',
+            # Additional MPEG variants
+            '.m2v', '.m2ts', '.mts', '.ts',
+            # QuickTime
+            '.qt',
+            # RealMedia
+            '.rm', '.rmvb',
+            # DivX/Xvid
+            '.divx',
+            # VOB (DVD)
+            '.vob',
+            # Apple formats
+            '.m4p',
+            # Other formats
+            '.asf', '.f4v', '.f4p', '.f4a', '.f4b'
+        )
+
+
+
     def check_and_setup_db(self):
         """Strictly manages DB location and handles path migration if moved."""
         if os.path.exists(self.db_path):
@@ -194,7 +219,7 @@ class PhotoOrganizer:
         tools_menu.add_command(label="Copy Starred Photos", command=self.open_copy_starred_window)
         tools_menu.add_command(label="Move Files by Year and Month", command=self.open_move_by_year_window)
         tools_menu.add_command(label="Copy Video Files", command=self.open_copy_videos_window)
-        tools_menu.add_command(label="Find Duplicate Photos", command=self.open_duplicate_finder_window)
+        tools_menu.add_command(label="Find Duplicate Photos/Videos", command=self.open_duplicate_finder_window)
         
         paned = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
@@ -286,12 +311,14 @@ class PhotoOrganizer:
                 starred INTEGER DEFAULT 0,
                 thumbnail BLOB,
                 label TEXT,
-                file_hash TEXT
+                file_hash TEXT,
+                file_type TEXT DEFAULT 'photo'
             )
         """)
         cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_folder ON photos(folder)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_hash ON photos(file_hash)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_type ON photos(file_type)")
         conn.commit()
         conn.close()
 
@@ -342,6 +369,7 @@ class PhotoOrganizer:
             path = self.tree.item(node, "values")[0]
             self.insert_subdirs(node, path)
 
+
     def on_tree_select(self, event):
         node = self.tree.focus()
         if not node:
@@ -351,23 +379,32 @@ class PhotoOrganizer:
         
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM photos WHERE folder=?", (path,))
+        cur.execute("SELECT COUNT(*) FROM photos WHERE folder=? AND file_type='photo'", (path,))
         count = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM photos WHERE folder=? AND starred=1", (path,))
+        cur.execute("SELECT COUNT(*) FROM photos WHERE folder=? AND starred=1 AND file_type='photo'", (path,))
         starred_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM photos WHERE folder=? AND file_type='video'", (path,))
+        video_count = cur.fetchone()[0]
         conn.close()
         
-        self.set_status(f"Selected: {path} | Photos: {count} | Starred: {starred_count}")
+        self.set_status(f"Selected: {path} | Photos: {count} | Starred: {starred_count} | Videos: {video_count}")
         
         threading.Thread(target=self.load_thumbnails_from_db, args=(path,), daemon=True).start()
 
+
+
+
+
+
+
     def scan_and_store_thumbnails_with_stats(self, folder):
-        """Scan and store thumbnails with summary statistics at the end"""
+        """Scan and store photos (with thumbnails) and videos (hash only) with summary statistics"""
         import hashlib
         
         self.set_status(f"Counting files in {folder}...")
         
         image_extensions = self.get_supported_image_extensions()
+        video_extensions = self.get_supported_video_extensions()
 
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
@@ -375,11 +412,12 @@ class PhotoOrganizer:
         total = 0
         for _root, _dirs, files in os.walk(folder):
             for f in files:
-                if f.lower().endswith(image_extensions):
+                if f.lower().endswith(image_extensions) or f.lower().endswith(video_extensions):
                     total += 1
 
         processed = 0
-        new_files = 0
+        new_photos = 0
+        new_videos = 0
         orientations_corrected = 0
         errors = 0
         
@@ -402,46 +440,60 @@ class PhotoOrganizer:
                     self.root.after(0, lambda: self.rescan_button.config(state='normal'))
                     self.root.after(0, lambda: self.cancel_scan_button.config(state='disabled'))
                     return
-                    
-                if f.lower().endswith(image_extensions):
-                    full_path = os.path.join(root_dir, f)
-                    
+                
+                full_path = os.path.join(root_dir, f)
+                is_image = f.lower().endswith(image_extensions)
+                is_video = f.lower().endswith(video_extensions)
+                
+                if is_image or is_video:
                     # Update status with progress
+                    file_type = "photo" if is_image else "video"
                     self.set_status(f"Scanning ({processed}/{total}): {full_path}")
 
                     cur.execute("SELECT path FROM photos WHERE path=?", (full_path,))
                     if cur.fetchone() is None:
                         try:
-                            # Calculate MD5 hash
+                            # Calculate MD5 hash for all files
                             hash_md5 = hashlib.md5()
                             with open(full_path, "rb") as f_hash:
                                 for chunk in iter(lambda: f_hash.read(4096), b""):
                                     hash_md5.update(chunk)
                             file_hash = hash_md5.hexdigest()
                             
-                            img = Image.open(full_path)
-                            
-                            # Check if image has orientation tag that needs correction
-                            try:
-                                exif = img.getexif()
-                                if exif and 274 in exif and exif[274] != 1:
-                                    orientations_corrected += 1
-                            except:
-                                pass
-                            
-                            # Apply EXIF orientation correction
-                            img = ImageOps.exif_transpose(img)
-                            
-                            img_copy = img.copy()
-                            img_copy.thumbnail((150, 150))
-                            with io.BytesIO() as output:
-                                img_copy.save(output, format='PNG')
-                                thumb_blob = output.getvalue()
-                            cur.execute(
-                                "INSERT OR REPLACE INTO photos (path, folder, thumbnail, file_hash) VALUES (?, ?, ?, ?)",
-                                (full_path, root_dir, thumb_blob, file_hash)
-                            )
-                            new_files += 1
+                            if is_image:
+                                # Process photos with thumbnails
+                                img = Image.open(full_path)
+                                
+                                # Check if image has orientation tag that needs correction
+                                try:
+                                    exif = img.getexif()
+                                    if exif and 274 in exif and exif[274] != 1:
+                                        orientations_corrected += 1
+                                except:
+                                    pass
+                                
+                                # Apply EXIF orientation correction
+                                img = ImageOps.exif_transpose(img)
+                                
+                                img_copy = img.copy()
+                                img_copy.thumbnail((150, 150))
+                                with io.BytesIO() as output:
+                                    img_copy.save(output, format='PNG')
+                                    thumb_blob = output.getvalue()
+                                
+                                cur.execute(
+                                    "INSERT OR REPLACE INTO photos (path, folder, thumbnail, file_hash, file_type) VALUES (?, ?, ?, ?, ?)",
+                                    (full_path, root_dir, thumb_blob, file_hash, 'photo')
+                                )
+                                new_photos += 1
+                            else:
+                                # Process videos without thumbnails
+                                cur.execute(
+                                    "INSERT OR REPLACE INTO photos (path, folder, file_hash, file_type) VALUES (?, ?, ?, ?)",
+                                    (full_path, root_dir, file_hash, 'video')
+                                )
+                                new_videos += 1
+                                
                         except Exception as e:
                             errors += 1
                             print(f"Error processing {full_path}: {e}")
@@ -459,7 +511,7 @@ class PhotoOrganizer:
             conn.close()
             
             # Build summary status message
-            status_msg = f"Rescan complete: {new_files} new files"
+            status_msg = f"Rescan complete: {new_photos} new photos, {new_videos} new videos"
             if orientations_corrected > 0:
                 status_msg += f" | {orientations_corrected} orientations corrected"
             if errors > 0:
@@ -477,6 +529,10 @@ class PhotoOrganizer:
         # Re-enable buttons
         self.root.after(0, lambda: self.rescan_button.config(state='normal'))
         self.root.after(0, lambda: self.cancel_scan_button.config(state='disabled'))
+
+
+
+
 
     def scan_and_store_thumbnails(self, folder):
         self.set_status(f"Scanning and storing thumbnails: {folder}...")
@@ -567,11 +623,13 @@ class PhotoOrganizer:
         
         self.root.after(0, lambda: self.load_thumbnails_from_db(folder))
 
+
     def load_thumbnails_from_db(self, folder):
         self.set_status(f"Loading thumbnails from database: {folder}...")
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
-        cur.execute("SELECT path, thumbnail, starred FROM photos WHERE folder=?", (folder,))
+        # Only load photos for display (filter out videos)
+        cur.execute("SELECT path, thumbnail, starred FROM photos WHERE folder=? AND file_type='photo'", (folder,))
         rows = cur.fetchall()
         conn.close()
 
@@ -585,7 +643,6 @@ class PhotoOrganizer:
         for path, thumb_blob, starred in rows:
             try:
                 img = Image.open(io.BytesIO(thumb_blob))
-                # No need to apply exif_transpose here - already corrected when stored
 
                 if starred:
                     draw = ImageDraw.Draw(img)
@@ -599,6 +656,8 @@ class PhotoOrganizer:
                 pass
 
         self.root.after(0, lambda: self.display_thumbnails_from_db(images))
+
+
 
     def display_thumbnails_from_db(self, images):
         for widget in self.thumbs_frame.winfo_children():
@@ -625,7 +684,7 @@ class PhotoOrganizer:
             except Exception:
                 pass
 
-        self.set_status(f"Loaded {len(images)} thumbnails from {self.current_folder}")
+        self.set_status(f"Loaded {len(images)} photo thumbnails from {self.current_folder}")
 
     def open_image_window(self, index):
         self.current_image_index = index
@@ -1640,6 +1699,8 @@ class PhotoOrganizer:
             threading.Thread(target=self._scan_duplicates_single, 
                             args=(single_folder,), daemon=True).start()
     
+
+
     def _scan_duplicates_compare(self, new_folder, existing_folder):
         """Scan for duplicate photos using file hash comparison from database"""
         import datetime
@@ -1649,76 +1710,80 @@ class PhotoOrganizer:
         existing_folder = os.path.normpath(existing_folder)
         
         # Build hash dictionary from database for existing photos
-        self.root.after(0, lambda: self.dup_status_var.set("Loading existing photo hashes from database..."))
+        self.root.after(0, lambda: self.dup_status_var.set("Loading existing file hashes from database..."))
         
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
         
-        # Get all hashes and paths for photos in existing folder
+        # Get all hashes and paths for files in existing folder (including file_type)
         cur.execute("""
-            SELECT file_hash, path, thumbnail FROM photos 
+            SELECT file_hash, path, thumbnail, file_type FROM photos 
             WHERE folder LIKE ? AND file_hash IS NOT NULL
         """, (existing_folder + '%',))
         
         existing_hashes = {}
         existing_thumbnails = {}
-        for file_hash, path, thumbnail in cur.fetchall():
+        existing_types = {}
+        for file_hash, path, thumbnail, file_type in cur.fetchall():
             if file_hash:
                 existing_hashes[file_hash] = path
                 if thumbnail:
                     existing_thumbnails[path] = thumbnail
+                existing_types[path] = file_type or 'photo'
         
         if len(existing_hashes) == 0:
             cur.execute("SELECT DISTINCT folder FROM photos LIMIT 5")
             sample_folders = [row[0] for row in cur.fetchall()]
-            error_msg = f"No scanned photos found in existing folder:\n{existing_folder}\n\n"
+            error_msg = f"No scanned files found in existing folder:\n{existing_folder}\n\n"
             error_msg += f"Sample folders in database:\n"
             error_msg += "\n".join(sample_folders) if sample_folders else "(No folders found)"
             error_msg += "\n\nPlease scan this folder first."
             
-            self.root.after(0, lambda: self.dup_status_var.set("No photos found in existing folder"))
-            self.root.after(0, lambda: messagebox.showwarning("No Photos Found", error_msg))
+            self.root.after(0, lambda: self.dup_status_var.set("No files found in existing folder"))
+            self.root.after(0, lambda: messagebox.showwarning("No Files Found", error_msg))
             self.root.after(0, lambda: self.dup_scan_button.config(state='normal'))
             conn.close()
             return
         
         self.root.after(0, lambda: self.dup_status_var.set(f"Loaded {len(existing_hashes)} hashes from existing folder"))
         
-        # Check new photos against existing - get file info from database
-        self.root.after(0, lambda: self.dup_status_var.set("Checking new photos for duplicates..."))
+        # Check new files against existing - get file info from database
+        self.root.after(0, lambda: self.dup_status_var.set("Checking new files for duplicates..."))
         duplicates = []
         
-        # Get path, hash, and thumbnail for new photos
+        # Get path, hash, thumbnail, and file_type for new files
         cur.execute("""
-            SELECT path, file_hash, thumbnail FROM photos 
+            SELECT path, file_hash, thumbnail, file_type FROM photos 
             WHERE folder LIKE ? AND file_hash IS NOT NULL
         """, (new_folder + '%',))
         
-        new_photos = cur.fetchall()
+        new_files = cur.fetchall()
         
-        if len(new_photos) == 0:
+        if len(new_files) == 0:
             cur.execute("SELECT DISTINCT folder FROM photos LIMIT 5")
             sample_folders = [row[0] for row in cur.fetchall()]
-            error_msg = f"No scanned photos found in new folder:\n{new_folder}\n\n"
+            error_msg = f"No scanned files found in new folder:\n{new_folder}\n\n"
             error_msg += f"Sample folders in database:\n"
             error_msg += "\n".join(sample_folders) if sample_folders else "(No folders found)"
             error_msg += "\n\nPlease scan this folder first."
             
-            self.root.after(0, lambda: self.dup_status_var.set("No photos found in new folder"))
-            self.root.after(0, lambda: messagebox.showwarning("No Photos Found", error_msg))
+            self.root.after(0, lambda: self.dup_status_var.set("No files found in new folder"))
+            self.root.after(0, lambda: messagebox.showwarning("No Files Found", error_msg))
             self.root.after(0, lambda: self.dup_scan_button.config(state='normal'))
             conn.close()
             return
         
-        self.root.after(0, lambda: self.dup_status_var.set(f"Checking {len(new_photos)} photos for duplicates..."))
+        self.root.after(0, lambda: self.dup_status_var.set(f"Checking {len(new_files)} files for duplicates..."))
         
         # Build list of duplicate hashes first (fast) and store thumbnails
         duplicate_hashes = {}
         new_thumbnails = {}
+        new_types = {}
         
-        for path, file_hash, thumbnail in new_photos:
+        for path, file_hash, thumbnail, file_type in new_files:
             if thumbnail:
                 new_thumbnails[path] = thumbnail
+            new_types[path] = file_type or 'photo'
             if file_hash and file_hash in existing_hashes:
                 duplicate_hashes[path] = (file_hash, existing_hashes[file_hash])
         
@@ -1754,7 +1819,8 @@ class PhotoOrganizer:
                     'size': new_size,
                     'modified': new_modified,
                     'size_mb': new_size / (1024 * 1024) if new_size > 0 else 0,
-                    'thumbnail': new_thumbnails.get(new_path)
+                    'thumbnail': new_thumbnails.get(new_path),
+                    'file_type': new_types.get(new_path, 'photo')
                 }
                 
                 existing_info = {
@@ -1762,7 +1828,8 @@ class PhotoOrganizer:
                     'size': existing_size,
                     'modified': existing_modified,
                     'size_mb': existing_size / (1024 * 1024) if existing_size > 0 else 0,
-                    'thumbnail': existing_thumbnails.get(existing_path)
+                    'thumbnail': existing_thumbnails.get(existing_path),
+                    'file_type': existing_types.get(existing_path, 'photo')
                 }
                 
                 duplicates.append({
@@ -1777,9 +1844,9 @@ class PhotoOrganizer:
         # Display results
         self.root.after(0, lambda: self.dup_status_var.set(f"Loading thumbnails for {len(duplicates)} duplicate pairs..."))
         self.root.after(0, lambda: self._display_duplicates(duplicates))
-    
+
     def _scan_duplicates_single(self, folder):
-        """Scan for duplicate photos within a single folder"""
+        """Scan for duplicate files within a single folder"""
         import datetime
         
         # Normalize path to use system separators
@@ -1787,22 +1854,22 @@ class PhotoOrganizer:
         
         self.root.after(0, lambda: self.dup_status_var.set("Loading hashes from database..."))
         
-        # Get all photos in folder from database with their hashes
+        # Get all files in folder from database with their hashes
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
         
         cur.execute("""
-            SELECT path, file_hash, thumbnail FROM photos 
+            SELECT path, file_hash, thumbnail, file_type FROM photos 
             WHERE folder LIKE ? AND file_hash IS NOT NULL
         """, (folder + '%',))
         
-        # Build hash dictionary: hash -> list of (path, thumbnail) tuples
+        # Build hash dictionary: hash -> list of (path, thumbnail, file_type) tuples
         hash_dict = {}
-        for path, file_hash, thumbnail in cur.fetchall():
+        for path, file_hash, thumbnail, file_type in cur.fetchall():
             if file_hash:
                 if file_hash not in hash_dict:
                     hash_dict[file_hash] = []
-                hash_dict[file_hash].append((path, thumbnail))
+                hash_dict[file_hash].append((path, thumbnail, file_type or 'photo'))
         
         conn.close()
         
@@ -1812,23 +1879,23 @@ class PhotoOrganizer:
         self.root.after(0, lambda: self.dup_status_var.set("Identifying duplicates..."))
         duplicate_groups = []
         
-        for file_hash, path_thumb_list in hash_dict.items():
-            if len(path_thumb_list) > 1:
+        for file_hash, path_thumb_type_list in hash_dict.items():
+            if len(path_thumb_type_list) > 1:
                 # Multiple files with same hash = duplicates
-                duplicate_groups.append(path_thumb_list)
+                duplicate_groups.append(path_thumb_type_list)
         
         # Now get file info only for duplicates
         total_duplicates = sum(len(group) for group in duplicate_groups)
-        self.root.after(0, lambda: self.dup_status_var.set(f"Getting file info for {total_duplicates} duplicate photos..."))
+        self.root.after(0, lambda: self.dup_status_var.set(f"Getting file info for {total_duplicates} duplicate files..."))
         
         duplicates = []
         processed = 0
         
-        for file_hash, path_thumb_list in hash_dict.items():
-            if len(path_thumb_list) > 1:
+        for file_hash, path_thumb_type_list in hash_dict.items():
+            if len(path_thumb_type_list) > 1:
                 # Multiple files with same hash = duplicates
                 # Treat first as "existing", rest as "new" (to delete)
-                existing_path, existing_thumbnail = path_thumb_list[0]
+                existing_path, existing_thumbnail, existing_type = path_thumb_type_list[0]
             
                 processed += 1
                 self.root.after(0, lambda p=processed, t=total_duplicates: 
@@ -1841,7 +1908,8 @@ class PhotoOrganizer:
                         'size': existing_stat.st_size,
                         'modified': datetime.datetime.fromtimestamp(existing_stat.st_mtime),
                         'size_mb': existing_stat.st_size / (1024 * 1024),
-                        'thumbnail': existing_thumbnail
+                        'thumbnail': existing_thumbnail,
+                        'file_type': existing_type
                     }
                 except:
                     existing_info = {
@@ -1849,10 +1917,11 @@ class PhotoOrganizer:
                         'size': 0,
                         'modified': datetime.datetime.now(),
                         'size_mb': 0,
-                        'thumbnail': existing_thumbnail
+                        'thumbnail': existing_thumbnail,
+                        'file_type': existing_type
                     }
             
-                for dup_path, dup_thumbnail in path_thumb_list[1:]:
+                for dup_path, dup_thumbnail, dup_type in path_thumb_type_list[1:]:
                     processed += 1
                     self.root.after(0, lambda p=processed, t=total_duplicates: 
                                    self.dup_status_var.set(f"Getting file info ({p}/{t})..."))
@@ -1864,7 +1933,8 @@ class PhotoOrganizer:
                             'size': dup_stat.st_size,
                             'modified': datetime.datetime.fromtimestamp(dup_stat.st_mtime),
                             'size_mb': dup_stat.st_size / (1024 * 1024),
-                            'thumbnail': dup_thumbnail
+                            'thumbnail': dup_thumbnail,
+                            'file_type': dup_type
                         }
                     except:
                         dup_info = {
@@ -1872,7 +1942,8 @@ class PhotoOrganizer:
                             'size': 0,
                             'modified': datetime.datetime.now(),
                             'size_mb': 0,
-                            'thumbnail': dup_thumbnail
+                            'thumbnail': dup_thumbnail,
+                            'file_type': dup_type
                         }
                 
                     if existing_info and dup_info:
@@ -1884,6 +1955,9 @@ class PhotoOrganizer:
         # Display results
         self.root.after(0, lambda: self.dup_status_var.set(f"Loading thumbnails for {len(duplicates)} duplicate pairs..."))
         self.root.after(0, lambda: self._display_duplicates(duplicates))
+
+
+
     
     def _display_duplicates(self, duplicates):
         """Display duplicate photos in the results frame"""
@@ -1932,13 +2006,13 @@ class PhotoOrganizer:
         
         self.dup_scan_button.config(state='normal')
         self.dup_delete_button.config(state='normal')
-    
+        
     def _create_duplicate_row_compare(self, idx, dup):
         """Create a row showing a duplicate pair for compare mode"""
         row_frame = ttk.Frame(self.dup_results_frame)
         row_frame.pack(fill=tk.X, pady=10, padx=5)
         
-        # Checkbox for deletion (new photo side only)
+        # Checkbox for deletion (new file side only)
         delete_var = tk.BooleanVar(value=True)  # Default to checked
         checkbox = ttk.Checkbutton(row_frame, variable=delete_var)
         checkbox.grid(row=0, column=0, padx=5, sticky='n')
@@ -1948,27 +2022,34 @@ class PhotoOrganizer:
             'path': dup['new']['path']
         })
         
-        # New photo info
+        # New file info
         new_frame = ttk.Frame(row_frame, relief='solid', borderwidth=1)
         new_frame.grid(row=0, column=1, padx=10, sticky='nsew')
         
-        # Try to load thumbnail
-        try:
-            # Use thumbnail from database if available
-            if dup['new'].get('thumbnail'):
-                img = Image.open(io.BytesIO(dup['new']['thumbnail']))
-            else:
-                # Fallback to loading from file
-                img = Image.open(dup['new']['path'])
-                img = ImageOps.exif_transpose(img)
-                img.thumbnail((150, 150))
-            
-            photo = ImageTk.PhotoImage(img)
-            lbl = ttk.Label(new_frame, image=photo)
-            lbl.image = photo  # Keep reference
-            lbl.pack(pady=5)
-        except:
-            ttk.Label(new_frame, text="[Image]", width=20).pack(pady=5)
+        # Try to load thumbnail or show VIDEO indicator
+        if dup['new'].get('file_type') == 'video':
+            # Show VIDEO label for videos
+            video_label = ttk.Label(new_frame, text="📹 VIDEO", font=('Arial', 14, 'bold'), 
+                                   foreground='blue', background='lightgray')
+            video_label.pack(pady=20)
+            ext = os.path.splitext(dup['new']['path'])[1].upper()
+            ttk.Label(new_frame, text=ext, font=('Arial', 10)).pack()
+        else:
+            # Try to load photo thumbnail
+            try:
+                if dup['new'].get('thumbnail'):
+                    img = Image.open(io.BytesIO(dup['new']['thumbnail']))
+                else:
+                    img = Image.open(dup['new']['path'])
+                    img = ImageOps.exif_transpose(img)
+                    img.thumbnail((150, 150))
+                
+                photo = ImageTk.PhotoImage(img)
+                lbl = ttk.Label(new_frame, image=photo)
+                lbl.image = photo  # Keep reference
+                lbl.pack(pady=5)
+            except:
+                ttk.Label(new_frame, text="[Image]", width=20).pack(pady=5)
         
         ttk.Label(new_frame, text=f"File: {os.path.basename(dup['new']['path'])}", 
                  wraplength=200).pack()
@@ -1978,27 +2059,34 @@ class PhotoOrganizer:
         # Arrow/equals sign
         ttk.Label(row_frame, text="=", font=('Arial', 20)).grid(row=0, column=2, padx=10)
         
-        # Existing photo info (no checkbox)
+        # Existing file info (no checkbox)
         existing_frame = ttk.Frame(row_frame, relief='solid', borderwidth=1)
         existing_frame.grid(row=0, column=3, padx=10, sticky='nsew')
         
-        # Try to load thumbnail
-        try:
-            # Use thumbnail from database if available
-            if dup['existing'].get('thumbnail'):
-                img = Image.open(io.BytesIO(dup['existing']['thumbnail']))
-            else:
-                # Fallback to loading from file
-                img = Image.open(dup['existing']['path'])
-                img = ImageOps.exif_transpose(img)
-                img.thumbnail((150, 150))
-            
-            photo = ImageTk.PhotoImage(img)
-            lbl = ttk.Label(existing_frame, image=photo)
-            lbl.image = photo  # Keep reference
-            lbl.pack(pady=5)
-        except:
-            ttk.Label(existing_frame, text="[Image]", width=20).pack(pady=5)
+        # Try to load thumbnail or show VIDEO indicator
+        if dup['existing'].get('file_type') == 'video':
+            # Show VIDEO label for videos
+            video_label = ttk.Label(existing_frame, text="📹 VIDEO", font=('Arial', 14, 'bold'), 
+                                   foreground='blue', background='lightgray')
+            video_label.pack(pady=20)
+            ext = os.path.splitext(dup['existing']['path'])[1].upper()
+            ttk.Label(existing_frame, text=ext, font=('Arial', 10)).pack()
+        else:
+            # Try to load photo thumbnail
+            try:
+                if dup['existing'].get('thumbnail'):
+                    img = Image.open(io.BytesIO(dup['existing']['thumbnail']))
+                else:
+                    img = Image.open(dup['existing']['path'])
+                    img = ImageOps.exif_transpose(img)
+                    img.thumbnail((150, 150))
+                
+                photo = ImageTk.PhotoImage(img)
+                lbl = ttk.Label(existing_frame, image=photo)
+                lbl.image = photo  # Keep reference
+                lbl.pack(pady=5)
+            except:
+                ttk.Label(existing_frame, text="[Image]", width=20).pack(pady=5)
         
         ttk.Label(existing_frame, text=f"File: {os.path.basename(dup['existing']['path'])}", 
                  wraplength=200).pack()
@@ -2007,27 +2095,36 @@ class PhotoOrganizer:
         
         # Separator
         ttk.Separator(self.dup_results_frame, orient='horizontal').pack(fill=tk.X, pady=10)
-    
+
+
+
 
     def _create_duplicate_row_single(self, idx, dup):
-            """Create a row showing a duplicate pair for single folder mode with radio buttons"""
-            row_frame = ttk.Frame(self.dup_results_frame)
-            row_frame.pack(fill=tk.X, pady=10, padx=5)
-            
-            # Radio button variable to track which photo to keep (shared between both photos)
-            keep_var = tk.StringVar(value="existing")  # Default keep first photo (delete second)
-            
-            # Radio button for Photo 1 (existing/first)
-            checkbox1_frame = ttk.Frame(row_frame)
-            checkbox1_frame.grid(row=0, column=0, padx=5, sticky='n')
-            
-            ttk.Radiobutton(checkbox1_frame, text="Keep", variable=keep_var, value="existing").pack()
-            
-            # Photo 1 info
-            photo1_frame = ttk.Frame(row_frame, relief='solid', borderwidth=1)
-            photo1_frame.grid(row=0, column=1, padx=10, sticky='nsew')
-            
-            # Try to load thumbnail
+        """Create a row showing a duplicate pair for single folder mode with radio buttons"""
+        row_frame = ttk.Frame(self.dup_results_frame)
+        row_frame.pack(fill=tk.X, pady=10, padx=5)
+        
+        # Radio button variable to track which file to keep (shared between both files)
+        keep_var = tk.StringVar(value="existing")  # Default keep first file (delete second)
+        
+        # Radio button for File 1 (existing/first)
+        checkbox1_frame = ttk.Frame(row_frame)
+        checkbox1_frame.grid(row=0, column=0, padx=5, sticky='n')
+        
+        ttk.Radiobutton(checkbox1_frame, text="Keep", variable=keep_var, value="existing").pack()
+        
+        # File 1 info
+        photo1_frame = ttk.Frame(row_frame, relief='solid', borderwidth=1)
+        photo1_frame.grid(row=0, column=1, padx=10, sticky='nsew')
+        
+        # Try to load thumbnail or show VIDEO indicator
+        if dup['existing'].get('file_type') == 'video':
+            video_label = ttk.Label(photo1_frame, text="📹 VIDEO", font=('Arial', 14, 'bold'), 
+                                   foreground='blue', background='lightgray')
+            video_label.pack(pady=20)
+            ext = os.path.splitext(dup['existing']['path'])[1].upper()
+            ttk.Label(photo1_frame, text=ext, font=('Arial', 10)).pack()
+        else:
             try:
                 if dup['existing'].get('thumbnail'):
                     img = Image.open(io.BytesIO(dup['existing']['thumbnail']))
@@ -2042,32 +2139,39 @@ class PhotoOrganizer:
                 lbl.pack(pady=5)
             except:
                 ttk.Label(photo1_frame, text="[Image]", width=20).pack(pady=5)
-            
-            ttk.Label(photo1_frame, text=f"File: {os.path.basename(dup['existing']['path'])}", 
-                     wraplength=200).pack()
-            ttk.Label(photo1_frame, text=f"Size: {dup['existing']['size_mb']:.2f} MB").pack()
-            ttk.Label(photo1_frame, text=f"Modified: {dup['existing']['modified'].strftime('%Y-%m-%d %H:%M')}").pack()
-            
-            path_text = dup['existing']['path']
-            if len(path_text) > 40:
-                path_text = "..." + path_text[-40:]
-            ttk.Label(photo1_frame, text=f"Path: {path_text}", 
-                     wraplength=200, font=('Arial', 8), anchor='e').pack(pady=(5,5))
-            
-            # Arrow/equals sign
-            ttk.Label(row_frame, text="=", font=('Arial', 20)).grid(row=0, column=2, padx=10)
-            
-            # Radio button for Photo 2 (new/second)
-            checkbox2_frame = ttk.Frame(row_frame)
-            checkbox2_frame.grid(row=0, column=3, padx=5, sticky='n')
-            
-            ttk.Radiobutton(checkbox2_frame, text="Keep", variable=keep_var, value="new").pack()
-            
-            # Photo 2 info
-            photo2_frame = ttk.Frame(row_frame, relief='solid', borderwidth=1)
-            photo2_frame.grid(row=0, column=4, padx=10, sticky='nsew')
-            
-            # Try to load thumbnail
+        
+        ttk.Label(photo1_frame, text=f"File: {os.path.basename(dup['existing']['path'])}", 
+                 wraplength=200).pack()
+        ttk.Label(photo1_frame, text=f"Size: {dup['existing']['size_mb']:.2f} MB").pack()
+        ttk.Label(photo1_frame, text=f"Modified: {dup['existing']['modified'].strftime('%Y-%m-%d %H:%M')}").pack()
+        
+        path_text = dup['existing']['path']
+        if len(path_text) > 40:
+            path_text = "..." + path_text[-40:]
+        ttk.Label(photo1_frame, text=f"Path: {path_text}", 
+                 wraplength=200, font=('Arial', 8), anchor='e').pack(pady=(5,5))
+        
+        # Arrow/equals sign
+        ttk.Label(row_frame, text="=", font=('Arial', 20)).grid(row=0, column=2, padx=10)
+        
+        # Radio button for File 2 (new/second)
+        checkbox2_frame = ttk.Frame(row_frame)
+        checkbox2_frame.grid(row=0, column=3, padx=5, sticky='n')
+        
+        ttk.Radiobutton(checkbox2_frame, text="Keep", variable=keep_var, value="new").pack()
+        
+        # File 2 info
+        photo2_frame = ttk.Frame(row_frame, relief='solid', borderwidth=1)
+        photo2_frame.grid(row=0, column=4, padx=10, sticky='nsew')
+        
+        # Try to load thumbnail or show VIDEO indicator
+        if dup['new'].get('file_type') == 'video':
+            video_label = ttk.Label(photo2_frame, text="📹 VIDEO", font=('Arial', 14, 'bold'), 
+                                   foreground='blue', background='lightgray')
+            video_label.pack(pady=20)
+            ext = os.path.splitext(dup['new']['path'])[1].upper()
+            ttk.Label(photo2_frame, text=ext, font=('Arial', 10)).pack()
+        else:
             try:
                 if dup['new'].get('thumbnail'):
                     img = Image.open(io.BytesIO(dup['new']['thumbnail']))
@@ -2082,35 +2186,33 @@ class PhotoOrganizer:
                 lbl.pack(pady=5)
             except:
                 ttk.Label(photo2_frame, text="[Image]", width=20).pack(pady=5)
-            
-            ttk.Label(photo2_frame, text=f"File: {os.path.basename(dup['new']['path'])}", 
-                     wraplength=200).pack()
-            ttk.Label(photo2_frame, text=f"Size: {dup['new']['size_mb']:.2f} MB").pack()
-            ttk.Label(photo2_frame, text=f"Modified: {dup['new']['modified'].strftime('%Y-%m-%d %H:%M')}").pack()
-            
-            path_text = dup['new']['path']
-            if len(path_text) > 40:
-                path_text = "..." + path_text[-40:]
-            ttk.Label(photo2_frame, text=f"Path: {path_text}", 
-                     wraplength=200, font=('Arial', 8), anchor='e').pack(pady=(5,5))
-            
-            # Store both photos with reference to the shared keep_var
-            # When keep_var == "existing", delete the "new" photo
-            # When keep_var == "new", delete the "existing" photo
-            self.dup_checkboxes.append({
-                'path': dup['new']['path'],
-                'keep_var': keep_var,
-                'keep_value': 'existing'  # Delete this path if 'existing' is selected (keep existing)
-            })
-            
-            self.dup_checkboxes.append({
-                'path': dup['existing']['path'],
-                'keep_var': keep_var,
-                'keep_value': 'new'  # Delete this path if 'new' is selected (keep new)
-            })
-            
-            # Separator
-            ttk.Separator(self.dup_results_frame, orient='horizontal').pack(fill=tk.X, pady=10)
+        
+        ttk.Label(photo2_frame, text=f"File: {os.path.basename(dup['new']['path'])}", 
+                 wraplength=200).pack()
+        ttk.Label(photo2_frame, text=f"Size: {dup['new']['size_mb']:.2f} MB").pack()
+        ttk.Label(photo2_frame, text=f"Modified: {dup['new']['modified'].strftime('%Y-%m-%d %H:%M')}").pack()
+        
+        path_text = dup['new']['path']
+        if len(path_text) > 40:
+            path_text = "..." + path_text[-40:]
+        ttk.Label(photo2_frame, text=f"Path: {path_text}", 
+                 wraplength=200, font=('Arial', 8), anchor='e').pack(pady=(5,5))
+        
+        # Store both files with reference to the shared keep_var
+        self.dup_checkboxes.append({
+            'path': dup['new']['path'],
+            'keep_var': keep_var,
+            'keep_value': 'existing'
+        })
+        
+        self.dup_checkboxes.append({
+            'path': dup['existing']['path'],
+            'keep_var': keep_var,
+            'keep_value': 'new'
+        })
+        
+        # Separator
+        ttk.Separator(self.dup_results_frame, orient='horizontal').pack(fill=tk.X, pady=10)
 
     
     def delete_selected_duplicates(self):
