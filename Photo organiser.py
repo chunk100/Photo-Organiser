@@ -1381,27 +1381,18 @@ class PhotoOrganizer:
         self.video_copy_button.config(state='disabled')
         
         threading.Thread(target=self._scan_videos_thread, args=(source,), daemon=True).start()
+        
+        
 
     def _scan_videos_thread(self, source_folder):
-        video_extensions = (
-            # Common formats
-            '.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.m4v', '.mpg', '.mpeg', 
-            '.3gp', '.webm', '.ogv',
-            # Additional MPEG variants
-            '.m2v', '.m2ts', '.mts', '.ts',
-            # QuickTime
-            '.qt',
-            # RealMedia
-            '.rm', '.rmvb',
-            # DivX/Xvid
-            '.divx',
-            # VOB (DVD)
-            '.vob',
-            # Apple formats
-            '.m4p',
-            # Other formats
-            '.asf', '.f4v', '.f4p', '.f4a', '.f4b'
-        )
+        # OLD CODE HAD THIS:
+        # video_extensions = (
+        #     '.mp4', '.avi', '.mov', ...
+        # )
+        
+        # NEW CODE - USE THE METHOD:
+        video_extensions = self.get_supported_video_extensions()
+        
         videos_found = []
         
         try:
@@ -1437,6 +1428,8 @@ class PhotoOrganizer:
             
         except Exception as e:
             self._update_video_results(f"\nError during scan: {str(e)}\n")
+        
+        
 
     def _update_video_results(self, message):
         def _update():
@@ -1534,6 +1527,7 @@ class PhotoOrganizer:
         
         self.root.after(0, lambda: self.video_copy_button.config(state='normal'))
 
+
     def open_duplicate_finder_window(self):
         """Opens window to find and manage duplicate photos"""
         dup_win = tk.Toplevel(self.root)
@@ -1597,18 +1591,50 @@ class PhotoOrganizer:
         results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
         # Canvas and scrollbar for results
-        canvas = tk.Canvas(results_frame)
-        scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=canvas.yview)
-        self.dup_results_frame = ttk.Frame(canvas)
+        self.dup_canvas = tk.Canvas(results_frame)
+        scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.dup_canvas.yview)
+        self.dup_results_frame = ttk.Frame(self.dup_canvas)
         
-        canvas.create_window((0, 0), window=self.dup_results_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+        self.dup_canvas.create_window((0, 0), window=self.dup_results_frame, anchor="nw")
+        self.dup_canvas.configure(yscrollcommand=scrollbar.set)
         
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.dup_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
+        # Bind the frame configure to update scroll region
         self.dup_results_frame.bind("<Configure>", 
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+            lambda e: self.dup_canvas.configure(scrollregion=self.dup_canvas.bbox("all")))
+        
+        # ADDED: Bind mouse wheel scrolling to canvas
+        def _on_mousewheel(event):
+            self.dup_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        
+        def _on_mousewheel_linux(event):
+            if event.num == 4:
+                self.dup_canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                self.dup_canvas.yview_scroll(1, "units")
+        
+        # Bind for Windows/Mac
+        self.dup_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        # Bind for Linux
+        self.dup_canvas.bind_all("<Button-4>", _on_mousewheel_linux)
+        self.dup_canvas.bind_all("<Button-5>", _on_mousewheel_linux)
+        
+        # Store reference to canvas for cleanup
+        self.dup_canvas_bindings = True
+        
+        # Unbind when window closes to avoid memory leaks
+        def _on_close():
+            try:
+                self.dup_canvas.unbind_all("<MouseWheel>")
+                self.dup_canvas.unbind_all("<Button-4>")
+                self.dup_canvas.unbind_all("<Button-5>")
+            except:
+                pass
+            dup_win.destroy()
+        
+        dup_win.protocol("WM_DELETE_WINDOW", _on_close)
         
         # Bottom buttons
         button_frame = ttk.Frame(dup_win)
@@ -1618,13 +1644,16 @@ class PhotoOrganizer:
                                            command=self.delete_selected_duplicates, state='disabled')
         self.dup_delete_button.pack(side=tk.LEFT, padx=5)
         
-        ttk.Button(button_frame, text="Close", command=dup_win.destroy).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(button_frame, text="Close", command=_on_close).pack(side=tk.RIGHT, padx=5)
         
         self.dup_window = dup_win
         self.dup_checkboxes = []  # Store checkbox variables and paths
         
         # Set initial mode
         self.update_duplicate_mode()
+
+
+
     
     def update_duplicate_mode(self):
         """Update UI based on selected duplicate detection mode"""
@@ -2105,7 +2134,7 @@ class PhotoOrganizer:
         row_frame.pack(fill=tk.X, pady=10, padx=5)
         
         # Radio button variable to track which file to keep (shared between both files)
-        keep_var = tk.StringVar(value="existing")  # Default keep first file (delete second)
+        keep_var = tk.StringVar(value="")  # Default keep first file (delete second)
         
         # Radio button for File 1 (existing/first)
         checkbox1_frame = ttk.Frame(row_frame)
