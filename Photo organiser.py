@@ -18,6 +18,7 @@ try:
 except ImportError:
     HEIF_SUPPORT = False
     print("pillow-heif not installed. HEIC/HEIF files will not be supported.")
+    messagebox.showinfo("STOP!! pillow-heif is not installed.  STOP and install otherwise many will be missed!")
 
 class PhotoOrganizer:
     CONFIG_KEY_LAST_FOLDER = "last_folder"
@@ -1528,6 +1529,39 @@ class PhotoOrganizer:
         self.root.after(0, lambda: self.video_copy_button.config(state='normal'))
 
 
+
+    def apply_bulk_selection(self):
+        """Apply bulk selection to all duplicate pairs - keep all left photos"""
+        if not self.dup_checkboxes:
+            return
+        
+        # Get the checkbox state
+        keep_all_left = self.dup_bulk_select_var.get()
+        
+        if keep_all_left:
+            # Set all radio buttons to "keep existing" (left photo)
+            # We need to find unique keep_var instances (one per duplicate pair)
+            seen_vars = set()
+            for item in self.dup_checkboxes:
+                if 'keep_var' in item:
+                    var_id = id(item['keep_var'])  # Use object ID to identify unique variables
+                    if var_id not in seen_vars:
+                        item['keep_var'].set('existing')  # Keep left photo
+                        seen_vars.add(var_id)
+        else:
+            # Clear all selections
+            seen_vars = set()
+            for item in self.dup_checkboxes:
+                if 'keep_var' in item:
+                    var_id = id(item['keep_var'])
+                    if var_id not in seen_vars:
+                        item['keep_var'].set('')  # Clear selection
+                        seen_vars.add(var_id)
+
+
+
+
+
     def open_duplicate_finder_window(self):
         """Opens window to find and manage duplicate photos"""
         dup_win = tk.Toplevel(self.root)
@@ -1576,7 +1610,7 @@ class PhotoOrganizer:
         ttk.Entry(self.single_frame, textvariable=self.dup_single_var, state='readonly').pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,5))
         ttk.Button(self.single_frame, text="Browse...", command=self.select_dup_single).pack(side=tk.RIGHT)
         
-        # Scan button
+        # Scan button and bulk selection
         scan_frame = ttk.Frame(dup_win)
         scan_frame.pack(fill=tk.X, padx=10, pady=5)
         
@@ -1585,6 +1619,17 @@ class PhotoOrganizer:
         
         self.dup_status_var = tk.StringVar(value="Select folders and click 'Scan for Duplicates'")
         ttk.Label(scan_frame, textvariable=self.dup_status_var).pack(side=tk.LEFT, padx=10)
+        
+        # ADD BULK SELECTION CHECKBOX (initially hidden, shown only in single mode after scan)
+        self.dup_bulk_select_var = tk.BooleanVar(value=False)
+        self.dup_bulk_select_checkbox = ttk.Checkbutton(
+            scan_frame, 
+            text="Keep all left photos (delete all right)", 
+            variable=self.dup_bulk_select_var,
+            command=self.apply_bulk_selection,
+            state='disabled'
+        )
+        # Don't pack it yet - will be shown after scan in single mode
         
         # Results frame with scrollbar
         results_frame = ttk.LabelFrame(dup_win, text="Duplicates Found", padding=10)
@@ -1605,7 +1650,7 @@ class PhotoOrganizer:
         self.dup_results_frame.bind("<Configure>", 
             lambda e: self.dup_canvas.configure(scrollregion=self.dup_canvas.bbox("all")))
         
-        # ADDED: Bind mouse wheel scrolling to canvas
+        # Bind mouse wheel scrolling to canvas
         def _on_mousewheel(event):
             self.dup_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
         
@@ -1651,6 +1696,7 @@ class PhotoOrganizer:
         
         # Set initial mode
         self.update_duplicate_mode()
+
 
 
 
@@ -1987,7 +2033,7 @@ class PhotoOrganizer:
 
 
 
-    
+
     def _display_duplicates(self, duplicates):
         """Display duplicate photos in the results frame"""
         # Clear previous results
@@ -1995,18 +2041,31 @@ class PhotoOrganizer:
             widget.destroy()
         
         self.dup_checkboxes = []
+        self.dup_image_refs = []  # CLEAR IMAGE REFERENCES
         
         if not duplicates:
             self.dup_status_var.set("No duplicates found!")
             ttk.Label(self.dup_results_frame, text="No duplicate photos were found.", 
                      font=('Arial', 12)).pack(pady=20)
             self.dup_scan_button.config(state='normal')
+            # Hide bulk selection checkbox
+            self.dup_bulk_select_checkbox.pack_forget()
+            self.dup_bulk_select_var.set(False)
             return
         
-        self.dup_status_var.set(f"Found {len(duplicates)} duplicate(s)")
+        self.dup_status_var.set(f"Found {len(duplicates)} duplicate(s) - Loading display...")
         
         # Determine mode for header labels
         mode = self.dup_mode_var.get()
+        
+        # Show bulk selection checkbox only in single mode
+        if mode == "single":
+            self.dup_bulk_select_checkbox.pack(side=tk.LEFT, padx=20)
+            self.dup_bulk_select_checkbox.config(state='normal')
+            self.dup_bulk_select_var.set(False)
+        else:
+            self.dup_bulk_select_checkbox.pack_forget()
+            self.dup_bulk_select_var.set(False)
         
         # Header
         header_frame = ttk.Frame(self.dup_results_frame)
@@ -2026,16 +2085,45 @@ class PhotoOrganizer:
         
         ttk.Separator(self.dup_results_frame, orient='horizontal').pack(fill=tk.X, pady=5)
         
-        # Display each duplicate pair
+        # Display each duplicate pair with progressive updates
         for idx, dup in enumerate(duplicates):
             if mode == "single":
                 self._create_duplicate_row_single(idx, dup)
             else:
                 self._create_duplicate_row_compare(idx, dup)
+            
+            # Update canvas scroll region every 10 rows to keep it responsive
+            if (idx + 1) % 10 == 0:
+                self.dup_results_frame.update_idletasks()
+                self.dup_canvas.configure(scrollregion=self.dup_canvas.bbox("all"))
+                self.dup_status_var.set(f"Found {len(duplicates)} duplicate(s) - Loaded {idx + 1}/{len(duplicates)}")
+        
+        # Force multiple comprehensive updates to ensure everything is rendered
+        self.dup_results_frame.update_idletasks()
+        self.dup_canvas.configure(scrollregion=self.dup_canvas.bbox("all"))
+        
+        # Schedule additional updates with increasing delays to catch late-loading images
+        def update_canvas(delay, attempt=1):
+            def do_update():
+                self.dup_results_frame.update_idletasks()
+                self.dup_canvas.configure(scrollregion=self.dup_canvas.bbox("all"))
+                if attempt == 1:
+                    self.dup_status_var.set(f"Found {len(duplicates)} duplicate(s) - Ready to review")
+            self.root.after(delay, do_update)
+        
+        # Multiple updates at different intervals to catch all image loads
+        update_canvas(100, 1)
+        update_canvas(500, 2)
+        update_canvas(1000, 3)
         
         self.dup_scan_button.config(state='normal')
         self.dup_delete_button.config(state='normal')
-        
+
+
+
+
+
+
     def _create_duplicate_row_compare(self, idx, dup):
         """Create a row showing a duplicate pair for compare mode"""
         row_frame = ttk.Frame(self.dup_results_frame)
@@ -2057,14 +2145,12 @@ class PhotoOrganizer:
         
         # Try to load thumbnail or show VIDEO indicator
         if dup['new'].get('file_type') == 'video':
-            # Show VIDEO label for videos
-            video_label = ttk.Label(new_frame, text="📹 VIDEO", font=('Arial', 14, 'bold'), 
+            video_label = ttk.Label(new_frame, text="🎹 VIDEO", font=('Arial', 14, 'bold'), 
                                    foreground='blue', background='lightgray')
             video_label.pack(pady=20)
             ext = os.path.splitext(dup['new']['path'])[1].upper()
             ttk.Label(new_frame, text=ext, font=('Arial', 10)).pack()
         else:
-            # Try to load photo thumbnail
             try:
                 if dup['new'].get('thumbnail'):
                     img = Image.open(io.BytesIO(dup['new']['thumbnail']))
@@ -2074,6 +2160,7 @@ class PhotoOrganizer:
                     img.thumbnail((150, 150))
                 
                 photo = ImageTk.PhotoImage(img)
+                self.dup_image_refs.append(photo)  # KEEP REFERENCE
                 lbl = ttk.Label(new_frame, image=photo)
                 lbl.image = photo  # Keep reference
                 lbl.pack(pady=5)
@@ -2094,14 +2181,12 @@ class PhotoOrganizer:
         
         # Try to load thumbnail or show VIDEO indicator
         if dup['existing'].get('file_type') == 'video':
-            # Show VIDEO label for videos
-            video_label = ttk.Label(existing_frame, text="📹 VIDEO", font=('Arial', 14, 'bold'), 
+            video_label = ttk.Label(existing_frame, text="🎹 VIDEO", font=('Arial', 14, 'bold'), 
                                    foreground='blue', background='lightgray')
             video_label.pack(pady=20)
             ext = os.path.splitext(dup['existing']['path'])[1].upper()
             ttk.Label(existing_frame, text=ext, font=('Arial', 10)).pack()
         else:
-            # Try to load photo thumbnail
             try:
                 if dup['existing'].get('thumbnail'):
                     img = Image.open(io.BytesIO(dup['existing']['thumbnail']))
@@ -2111,6 +2196,7 @@ class PhotoOrganizer:
                     img.thumbnail((150, 150))
                 
                 photo = ImageTk.PhotoImage(img)
+                self.dup_image_refs.append(photo)  # KEEP REFERENCE
                 lbl = ttk.Label(existing_frame, image=photo)
                 lbl.image = photo  # Keep reference
                 lbl.pack(pady=5)
@@ -2124,8 +2210,6 @@ class PhotoOrganizer:
         
         # Separator
         ttk.Separator(self.dup_results_frame, orient='horizontal').pack(fill=tk.X, pady=10)
-
-
 
 
     def _create_duplicate_row_single(self, idx, dup):
@@ -2148,7 +2232,7 @@ class PhotoOrganizer:
         
         # Try to load thumbnail or show VIDEO indicator
         if dup['existing'].get('file_type') == 'video':
-            video_label = ttk.Label(photo1_frame, text="📹 VIDEO", font=('Arial', 14, 'bold'), 
+            video_label = ttk.Label(photo1_frame, text="🎹 VIDEO", font=('Arial', 14, 'bold'), 
                                    foreground='blue', background='lightgray')
             video_label.pack(pady=20)
             ext = os.path.splitext(dup['existing']['path'])[1].upper()
@@ -2163,6 +2247,7 @@ class PhotoOrganizer:
                     img.thumbnail((150, 150))
                 
                 photo = ImageTk.PhotoImage(img)
+                self.dup_image_refs.append(photo)  # KEEP REFERENCE
                 lbl = ttk.Label(photo1_frame, image=photo)
                 lbl.image = photo
                 lbl.pack(pady=5)
@@ -2195,7 +2280,7 @@ class PhotoOrganizer:
         
         # Try to load thumbnail or show VIDEO indicator
         if dup['new'].get('file_type') == 'video':
-            video_label = ttk.Label(photo2_frame, text="📹 VIDEO", font=('Arial', 14, 'bold'), 
+            video_label = ttk.Label(photo2_frame, text="🎹 VIDEO", font=('Arial', 14, 'bold'), 
                                    foreground='blue', background='lightgray')
             video_label.pack(pady=20)
             ext = os.path.splitext(dup['new']['path'])[1].upper()
@@ -2210,6 +2295,7 @@ class PhotoOrganizer:
                     img.thumbnail((150, 150))
                 
                 photo = ImageTk.PhotoImage(img)
+                self.dup_image_refs.append(photo)  # KEEP REFERENCE
                 lbl = ttk.Label(photo2_frame, image=photo)
                 lbl.image = photo
                 lbl.pack(pady=5)
@@ -2242,6 +2328,7 @@ class PhotoOrganizer:
         
         # Separator
         ttk.Separator(self.dup_results_frame, orient='horizontal').pack(fill=tk.X, pady=10)
+
 
     
     def delete_selected_duplicates(self):
