@@ -1538,6 +1538,9 @@ class PhotoOrganizer:
         # Get the checkbox state
         keep_all_left = self.dup_bulk_select_var.get()
         
+        # Check if we're in table view mode
+        show_thumbnails = self.dup_show_thumbnails_var.get()
+        
         if keep_all_left:
             # Set all radio buttons to "keep existing" (left photo)
             # We need to find unique keep_var instances (one per duplicate pair)
@@ -1548,6 +1551,10 @@ class PhotoOrganizer:
                     if var_id not in seen_vars:
                         item['keep_var'].set('existing')  # Keep left photo
                         seen_vars.add(var_id)
+                        
+                        # If in table mode, update the table display
+                        if not show_thumbnails and 'tree_item' in item and hasattr(self, 'dup_tree'):
+                            self.dup_tree.set(item['tree_item'], "keep", "Keep Left")
         else:
             # Clear all selections
             seen_vars = set()
@@ -1557,20 +1564,24 @@ class PhotoOrganizer:
                     if var_id not in seen_vars:
                         item['keep_var'].set('')  # Clear selection
                         seen_vars.add(var_id)
-
-
-
-
+                        
+                        # If in table mode, update the table display
+                        if not show_thumbnails and 'tree_item' in item and hasattr(self, 'dup_tree'):
+                            self.dup_tree.set(item['tree_item'], "keep", "Left / Right")
 
     def open_duplicate_finder_window(self):
         """Opens window to find and manage duplicate photos"""
         dup_win = tk.Toplevel(self.root)
         dup_win.title("Find Duplicate Photos")
-        dup_win.geometry("1000x750")
+        dup_win.geometry("1500x700")  # Fixed size instead of fullscreen
         dup_win.transient(self.root)
         
+        # Create main container to control layout better
+        main_container = ttk.Frame(dup_win)
+        main_container.pack(fill=tk.BOTH, expand=True)
+        
         # Mode selection
-        mode_frame = ttk.LabelFrame(dup_win, text="Detection Mode", padding=10)
+        mode_frame = ttk.LabelFrame(main_container, text="Detection Mode", padding=10)
         mode_frame.pack(fill=tk.X, padx=10, pady=5)
         
         self.dup_mode_var = tk.StringVar(value="compare")
@@ -1582,7 +1593,7 @@ class PhotoOrganizer:
                        command=self.update_duplicate_mode).pack(anchor=tk.W, pady=2)
         
         # Container for folder selection (so we can manage packing order)
-        self.folder_container = ttk.Frame(dup_win)
+        self.folder_container = ttk.Frame(main_container)
         self.folder_container.pack(fill=tk.X, padx=10, pady=5)
         
         # New photos folder
@@ -1610,8 +1621,8 @@ class PhotoOrganizer:
         ttk.Entry(self.single_frame, textvariable=self.dup_single_var, state='readonly').pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,5))
         ttk.Button(self.single_frame, text="Browse...", command=self.select_dup_single).pack(side=tk.RIGHT)
         
-        # Scan button and bulk selection
-        scan_frame = ttk.Frame(dup_win)
+        # Scan button and options
+        scan_frame = ttk.Frame(main_container)
         scan_frame.pack(fill=tk.X, padx=10, pady=5)
         
         self.dup_scan_button = ttk.Button(scan_frame, text="Scan for Duplicates", command=self.scan_for_duplicates)
@@ -1620,7 +1631,18 @@ class PhotoOrganizer:
         self.dup_status_var = tk.StringVar(value="Select folders and click 'Scan for Duplicates'")
         ttk.Label(scan_frame, textvariable=self.dup_status_var).pack(side=tk.LEFT, padx=10)
         
-        # ADD BULK SELECTION CHECKBOX (initially hidden, shown only in single mode after scan)
+        # ADD THUMBNAIL TOGGLE CHECKBOX
+        self.dup_show_thumbnails_var = tk.BooleanVar(value=True)  # Default to showing thumbnails
+        self.dup_thumbnail_checkbox = ttk.Checkbutton(
+            scan_frame, 
+            text="Show thumbnails", 
+            variable=self.dup_show_thumbnails_var,
+            command=self.toggle_thumbnail_display,
+            state='disabled'  # Disabled until scan completes
+        )
+        self.dup_thumbnail_checkbox.pack(side=tk.RIGHT, padx=5)
+        
+        # BULK SELECTION CHECKBOX (initially hidden, shown only in single mode after scan)
         self.dup_bulk_select_var = tk.BooleanVar(value=False)
         self.dup_bulk_select_checkbox = ttk.Checkbutton(
             scan_frame, 
@@ -1631,8 +1653,8 @@ class PhotoOrganizer:
         )
         # Don't pack it yet - will be shown after scan in single mode
         
-        # Results frame with scrollbar
-        results_frame = ttk.LabelFrame(dup_win, text="Duplicates Found", padding=10)
+        # Results frame with scrollbar - THIS EXPANDS TO FILL AVAILABLE SPACE
+        results_frame = ttk.LabelFrame(main_container, text="Duplicates Found", padding=10)
         results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
         # Canvas and scrollbar for results
@@ -1669,36 +1691,25 @@ class PhotoOrganizer:
         # Store reference to canvas for cleanup
         self.dup_canvas_bindings = True
         
-        # Unbind when window closes to avoid memory leaks
-        def _on_close():
-            try:
-                self.dup_canvas.unbind_all("<MouseWheel>")
-                self.dup_canvas.unbind_all("<Button-4>")
-                self.dup_canvas.unbind_all("<Button-5>")
-            except:
-                pass
-            dup_win.destroy()
-        
-        dup_win.protocol("WM_DELETE_WINDOW", _on_close)
-        
-        # Bottom buttons
-        button_frame = ttk.Frame(dup_win)
+        # Bottom buttons - PACK AFTER RESULTS FRAME (NO EXPAND)
+        button_frame = ttk.Frame(main_container)
         button_frame.pack(fill=tk.X, padx=10, pady=10)
         
         self.dup_delete_button = ttk.Button(button_frame, text="Delete Selected Duplicates", 
                                            command=self.delete_selected_duplicates, state='disabled')
         self.dup_delete_button.pack(side=tk.LEFT, padx=5)
         
-        ttk.Button(button_frame, text="Close", command=_on_close).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(button_frame, text="Close", command=lambda: self._close_dup_window(dup_win)).pack(side=tk.RIGHT, padx=5)
+        
+        # Set up close handler
+        dup_win.protocol("WM_DELETE_WINDOW", lambda: self._close_dup_window(dup_win))
         
         self.dup_window = dup_win
         self.dup_checkboxes = []  # Store checkbox variables and paths
+        self.dup_duplicates_data = []  # Store duplicate data for re-rendering
         
         # Set initial mode
         self.update_duplicate_mode()
-
-
-
 
     
     def update_duplicate_mode(self):
@@ -2034,8 +2045,17 @@ class PhotoOrganizer:
 
 
 
+    def toggle_thumbnail_display(self):
+        """Toggle between thumbnail view and table view"""
+        if hasattr(self, 'dup_duplicates_data') and self.dup_duplicates_data:
+            # Re-render the display with the new setting
+            self._display_duplicates(self.dup_duplicates_data)
+
     def _display_duplicates(self, duplicates):
         """Display duplicate photos in the results frame"""
+        # Store duplicates data for re-rendering when toggling thumbnails
+        self.dup_duplicates_data = duplicates
+        
         # Clear previous results
         for widget in self.dup_results_frame.winfo_children():
             widget.destroy()
@@ -2048,10 +2068,14 @@ class PhotoOrganizer:
             ttk.Label(self.dup_results_frame, text="No duplicate photos were found.", 
                      font=('Arial', 12)).pack(pady=20)
             self.dup_scan_button.config(state='normal')
+            self.dup_thumbnail_checkbox.config(state='disabled')
             # Hide bulk selection checkbox
             self.dup_bulk_select_checkbox.pack_forget()
             self.dup_bulk_select_var.set(False)
             return
+        
+        # Enable thumbnail toggle checkbox
+        self.dup_thumbnail_checkbox.config(state='normal')
         
         self.dup_status_var.set(f"Found {len(duplicates)} duplicate(s) - Loading display...")
         
@@ -2067,6 +2091,23 @@ class PhotoOrganizer:
             self.dup_bulk_select_checkbox.pack_forget()
             self.dup_bulk_select_var.set(False)
         
+        # Check if we should show thumbnails
+        show_thumbnails = self.dup_show_thumbnails_var.get()
+        
+        if show_thumbnails:
+            # Original thumbnail view
+            self._display_duplicates_with_thumbnails(duplicates, mode)
+        else:
+            # New table view without thumbnails
+            self._display_duplicates_table(duplicates, mode)
+        
+        self.dup_scan_button.config(state='normal')
+        self.dup_delete_button.config(state='normal')
+        
+        
+        
+    def _display_duplicates_with_thumbnails(self, duplicates, mode):
+        """Display duplicates with thumbnails (original view)"""
         # Header
         header_frame = ttk.Frame(self.dup_results_frame)
         header_frame.pack(fill=tk.X, pady=(0, 10))
@@ -2085,44 +2126,208 @@ class PhotoOrganizer:
         
         ttk.Separator(self.dup_results_frame, orient='horizontal').pack(fill=tk.X, pady=5)
         
-        # Display each duplicate pair with progressive updates
+        # Display each duplicate pair - LOAD ALL AT ONCE
         for idx, dup in enumerate(duplicates):
             if mode == "single":
                 self._create_duplicate_row_single(idx, dup)
             else:
                 self._create_duplicate_row_compare(idx, dup)
-            
-            # Update canvas scroll region every 10 rows to keep it responsive
-            if (idx + 1) % 10 == 0:
-                self.dup_results_frame.update_idletasks()
-                self.dup_canvas.configure(scrollregion=self.dup_canvas.bbox("all"))
-                self.dup_status_var.set(f"Found {len(duplicates)} duplicate(s) - Loaded {idx + 1}/{len(duplicates)}")
         
-        # Force multiple comprehensive updates to ensure everything is rendered
+        # Single update at the end
         self.dup_results_frame.update_idletasks()
         self.dup_canvas.configure(scrollregion=self.dup_canvas.bbox("all"))
         
-        # Schedule additional updates with increasing delays to catch late-loading images
-        def update_canvas(delay, attempt=1):
-            def do_update():
-                self.dup_results_frame.update_idletasks()
-                self.dup_canvas.configure(scrollregion=self.dup_canvas.bbox("all"))
-                if attempt == 1:
-                    self.dup_status_var.set(f"Found {len(duplicates)} duplicate(s) - Ready to review")
-            self.root.after(delay, do_update)
+        self.dup_status_var.set(f"Found {len(duplicates)} duplicate(s) - Ready to review")
+         
+    def _display_duplicates_table(self, duplicates, mode):
+        """Display duplicates in a simple table without thumbnails"""
+        # Create a frame with a treeview for table display
+        table_frame = ttk.Frame(self.dup_results_frame)
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # Multiple updates at different intervals to catch all image loads
-        update_canvas(100, 1)
-        update_canvas(500, 2)
-        update_canvas(1000, 3)
+        # Create Treeview with scrollbar
+        tree_scroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         
-        self.dup_scan_button.config(state='normal')
-        self.dup_delete_button.config(state='normal')
+        if mode == "single":
+            columns = ("keep", "file1", "size1", "modified1", "file2", "size2", "modified2")
+            tree = ttk.Treeview(table_frame, columns=columns, show='headings', 
+                               yscrollcommand=tree_scroll.set, selectmode='none')
+            
+            tree.heading("keep", text="Keep Which?")
+            tree.heading("file1", text="File 1 (with path)")
+            tree.heading("size1", text="Size (MB)")
+            tree.heading("modified1", text="Modified")
+            tree.heading("file2", text="File 2 (with path)")
+            tree.heading("size2", text="Size (MB)")
+            tree.heading("modified2", text="Modified")
+            
+            tree.column("keep", width=100, anchor='center')
+            tree.column("file1", width=400, anchor='center')  # Changed to center
+            tree.column("size1", width=80, anchor='center')  # Changed to center
+            tree.column("modified1", width=140, anchor='center')  # Changed to center
+            tree.column("file2", width=400, anchor='center')  # Changed to center
+            tree.column("size2", width=80, anchor='center')  # Changed to center
+            tree.column("modified2", width=140, anchor='center')  # Changed to center
+        else:
+            columns = ("delete", "new_file", "new_size", "new_modified", "existing_file", "existing_size", "existing_modified")
+            tree = ttk.Treeview(table_frame, columns=columns, show='headings', 
+                               yscrollcommand=tree_scroll.set, selectmode='none')
+            
+            tree.heading("delete", text="Delete?")
+            tree.heading("new_file", text="New File (with path)")
+            tree.heading("new_size", text="Size (MB)")
+            tree.heading("new_modified", text="Modified")
+            tree.heading("existing_file", text="Existing File (with path)")
+            tree.heading("existing_size", text="Size (MB)")
+            tree.heading("existing_modified", text="Modified")
+            
+            tree.column("delete", width=80, anchor='center')
+            tree.column("new_file", width=400, anchor='center')  # Changed to center
+            tree.column("new_size", width=80, anchor='center')  # Changed to center
+            tree.column("new_modified", width=140, anchor='center')  # Changed to center
+            tree.column("existing_file", width=400, anchor='center')  # Changed to center
+            tree.column("existing_size", width=80, anchor='center')  # Changed to center
+            tree.column("existing_modified", width=140, anchor='center')  # Changed to center
+        
+        tree_scroll.config(command=tree.yview)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # STORE REFERENCE TO TREE for bulk selection updates
+        self.dup_tree = tree
+        
+        # Helper function to format file path for display
+        def format_file_display(full_path, max_length=60):
+            """Format file path to show: filename + end of directory path"""
+            filename = os.path.basename(full_path)
+            directory = os.path.dirname(full_path)
+            
+            # If directory is short enough, show it all
+            if len(directory) <= max_length - len(filename) - 3:
+                return f"{filename} ({directory})"
+            
+            # Otherwise, show last part of directory
+            path_suffix_length = max_length - len(filename) - 6  # Leave room for ".../" and " (...)"
+            if path_suffix_length > 0:
+                dir_suffix = directory[-path_suffix_length:]
+                return f"{filename} (...{dir_suffix})"
+            else:
+                # Just show filename if path is too long
+                return filename
+        
+        # Add rows with embedded widgets for radio buttons/checkboxes
+        for idx, dup in enumerate(duplicates):
+            if mode == "single":
+                # Create a frame to hold the radio buttons
+                keep_var = tk.StringVar(value="")
+                
+                # Insert row with formatted paths
+                file1_display = format_file_display(dup['existing']['path'])
+                size1 = f"{dup['existing']['size_mb']:.2f}"
+                mod1 = dup['existing']['modified'].strftime('%Y-%m-%d %H:%M')
+                
+                file2_display = format_file_display(dup['new']['path'])
+                size2 = f"{dup['new']['size_mb']:.2f}"
+                mod2 = dup['new']['modified'].strftime('%Y-%m-%d %H:%M')
+                
+                item_id = tree.insert("", "end", values=(
+                    "Left / Right",  # Placeholder for radio buttons
+                    file1_display, size1, mod1,
+                    file2_display, size2, mod2
+                ))
+                
+                # Store the data
+                self.dup_checkboxes.append({
+                    'path': dup['new']['path'],
+                    'keep_var': keep_var,
+                    'keep_value': 'existing',
+                    'tree_item': item_id
+                })
+                
+                self.dup_checkboxes.append({
+                    'path': dup['existing']['path'],
+                    'keep_var': keep_var,
+                    'keep_value': 'new',
+                    'tree_item': item_id
+                })
+                
+            else:  # compare mode
+                delete_var = tk.BooleanVar(value=True)
+                
+                new_file_display = format_file_display(dup['new']['path'])
+                new_size = f"{dup['new']['size_mb']:.2f}"
+                new_mod = dup['new']['modified'].strftime('%Y-%m-%d %H:%M')
+                
+                existing_file_display = format_file_display(dup['existing']['path'])
+                existing_size = f"{dup['existing']['size_mb']:.2f}"
+                existing_mod = dup['existing']['modified'].strftime('%Y-%m-%d %H:%M')
+                
+                check_mark = "✓" if delete_var.get() else ""
+                
+                item_id = tree.insert("", "end", values=(
+                    check_mark,
+                    new_file_display, new_size, new_mod,
+                    existing_file_display, existing_size, existing_mod
+                ))
+                
+                self.dup_checkboxes.append({
+                    'var': delete_var,
+                    'path': dup['new']['path'],
+                    'tree_item': item_id
+                })
+        
+        # Add click handlers for the table
+        if mode == "single":
+            def on_table_click(event):
+                region = tree.identify_region(event.x, event.y)
+                if region == "cell":
+                    column = tree.identify_column(event.x)
+                    item = tree.identify_row(event.y)
+                    
+                    if column == "#1" and item:  # "Keep Which?" column
+                        # Find the corresponding checkbox items
+                        for cb_item in self.dup_checkboxes:
+                            if cb_item.get('tree_item') == item and 'keep_var' in cb_item:
+                                current = cb_item['keep_var'].get()
+                                # Toggle between left, right, and none
+                                if current == "":
+                                    cb_item['keep_var'].set("existing")
+                                    tree.set(item, "keep", "Keep Left")
+                                elif current == "existing":
+                                    cb_item['keep_var'].set("new")
+                                    tree.set(item, "keep", "Keep Right")
+                                else:
+                                    cb_item['keep_var'].set("")
+                                    tree.set(item, "keep", "Left / Right")
+                                break
+            
+            tree.bind("<Button-1>", on_table_click)
+        else:
+            def on_table_click_compare(event):
+                region = tree.identify_region(event.x, event.y)
+                if region == "cell":
+                    column = tree.identify_column(event.x)
+                    item = tree.identify_row(event.y)
+                    
+                    if column == "#1" and item:  # "Delete?" column
+                        # Find the corresponding checkbox item
+                        for cb_item in self.dup_checkboxes:
+                            if cb_item.get('tree_item') == item:
+                                current = cb_item['var'].get()
+                                cb_item['var'].set(not current)
+                                tree.set(item, "delete", "✓" if not current else "")
+                                break
+            
+            tree.bind("<Button-1>", on_table_click_compare)
+        
+        self.dup_status_var.set(f"Found {len(duplicates)} duplicate(s) - Table view (click 'Keep Which?' or 'Delete?' to toggle)")
+        
+        # Update scroll region
+        self.dup_results_frame.update_idletasks()
+        self.dup_canvas.configure(scrollregion=self.dup_canvas.bbox("all"))
 
-
-
-
-
+ 
+    
 
     def _create_duplicate_row_compare(self, idx, dup):
         """Create a row showing a duplicate pair for compare mode"""
