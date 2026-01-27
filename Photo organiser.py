@@ -6,9 +6,13 @@ import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk, ImageOps, ImageDraw
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 import io
 import time
 import shutil
+import csv
+from datetime import datetime
 
 # Add HEIC/HEIF support if available
 try:
@@ -402,6 +406,11 @@ class PhotoOrganizer:
         """Scan and store photos (with thumbnails) and videos (hash only) with summary statistics"""
         import hashlib
         
+         # Create log file for this scan
+        log_filename = f"scan_errors_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        log_path = os.path.join(self.script_dir, log_filename)
+        error_log = []    
+        
         self.set_status(f"Counting files in {folder}...")
         
         image_extensions = self.get_supported_image_extensions()
@@ -497,7 +506,16 @@ class PhotoOrganizer:
                                 
                         except Exception as e:
                             errors += 1
+                            error_msg = str(e)
+                            error_log.append({
+                                'file_path': full_path,
+                                'file_name': f,
+                                'file_type': 'photo' if is_image else 'video',
+                                'error': error_msg,
+                                'file_size_bytes': os.path.getsize(full_path) if os.path.exists(full_path) else 0
+                            })
                             print(f"Error processing {full_path}: {e}")
+
                     
                     processed += 1
 
@@ -522,10 +540,36 @@ class PhotoOrganizer:
             
             self.set_status(status_msg)
             
+            self.set_status(status_msg)
+        
+            # Write error log if there were any errors
+            if error_log:
+                try:
+                    with open(log_path, 'w', newline='', encoding='utf-8') as csvfile:
+                        fieldnames = ['file_path', 'file_name', 'file_type', 'error', 'file_size_bytes']
+                        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                        writer.writeheader()
+                        writer.writerows(error_log)
+                    
+                    status_msg += f" | Error log: {log_filename}"
+                    self.set_status(status_msg)
+                except Exception as e:
+                    print(f"Failed to write error log: {e}")
+            
+            # Reload thumbnails for current folder
+            self.root.after(0, lambda: self.load_thumbnails_from_db(folder))
+            
             # Reload thumbnails for current folder
             self.root.after(0, lambda: self.load_thumbnails_from_db(folder))
         else:
             conn.close()
+            
+
+
+        
+        
+        
+        
         
         # Re-enable buttons
         self.root.after(0, lambda: self.rescan_button.config(state='normal'))
@@ -1569,6 +1613,31 @@ class PhotoOrganizer:
                         if not show_thumbnails and 'tree_item' in item and hasattr(self, 'dup_tree'):
                             self.dup_tree.set(item['tree_item'], "keep", "Left / Right")
 
+
+    def _close_dup_window(self, window):
+        """Clean up and close the duplicate finder window"""
+        # Unbind mouse wheel events to prevent errors after window closes
+        if hasattr(self, 'dup_canvas') and hasattr(self, 'dup_canvas_bindings'):
+            try:
+                self.dup_canvas.unbind_all("<MouseWheel>")
+                self.dup_canvas.unbind_all("<Button-4>")
+                self.dup_canvas.unbind_all("<Button-5>")
+            except:
+                pass
+        
+        # Clear references to prevent memory leaks
+        if hasattr(self, 'dup_image_refs'):
+            self.dup_image_refs.clear()
+        if hasattr(self, 'dup_checkboxes'):
+            self.dup_checkboxes.clear()
+        if hasattr(self, 'dup_duplicates_data'):
+            self.dup_duplicates_data = []
+        
+        # Destroy the window
+        window.destroy()
+
+
+
     def open_duplicate_finder_window(self):
         """Opens window to find and manage duplicate photos"""
         dup_win = tk.Toplevel(self.root)
@@ -1632,7 +1701,7 @@ class PhotoOrganizer:
         ttk.Label(scan_frame, textvariable=self.dup_status_var).pack(side=tk.LEFT, padx=10)
         
         # ADD THUMBNAIL TOGGLE CHECKBOX
-        self.dup_show_thumbnails_var = tk.BooleanVar(value=True)  # Default to showing thumbnails
+        self.dup_show_thumbnails_var = tk.BooleanVar(value=False)  # Default to showing thumbnails
         self.dup_thumbnail_checkbox = ttk.Checkbutton(
             scan_frame, 
             text="Show thumbnails", 
@@ -1804,8 +1873,8 @@ class PhotoOrganizer:
         # Get all hashes and paths for files in existing folder (including file_type)
         cur.execute("""
             SELECT file_hash, path, thumbnail, file_type FROM photos 
-            WHERE folder LIKE ? AND file_hash IS NOT NULL
-        """, (existing_folder + '%',))
+            WHERE (folder = ? OR folder LIKE ?) AND file_hash IS NOT NULL
+        """, (existing_folder, existing_folder + os.sep + '%'))
         
         existing_hashes = {}
         existing_thumbnails = {}
@@ -1840,8 +1909,8 @@ class PhotoOrganizer:
         # Get path, hash, thumbnail, and file_type for new files
         cur.execute("""
             SELECT path, file_hash, thumbnail, file_type FROM photos 
-            WHERE folder LIKE ? AND file_hash IS NOT NULL
-        """, (new_folder + '%',))
+            WHERE (folder = ? OR folder LIKE ?) AND file_hash IS NOT NULL
+        """, (new_folder, new_folder + os.sep + '%'))
         
         new_files = cur.fetchall()
         
@@ -2139,8 +2208,9 @@ class PhotoOrganizer:
         
         self.dup_status_var.set(f"Found {len(duplicates)} duplicate(s) - Ready to review")
          
+
     def _display_duplicates_table(self, duplicates, mode):
-        """Display duplicates in a simple table without thumbnails"""
+        """Display duplicates in a simple table without thumbnails - works for both compare and single modes"""
         # Create a frame with a treeview for table display
         table_frame = ttk.Frame(self.dup_results_frame)
         table_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -2163,13 +2233,13 @@ class PhotoOrganizer:
             tree.heading("modified2", text="Modified")
             
             tree.column("keep", width=100, anchor='center')
-            tree.column("file1", width=400, anchor='center')  # Changed to center
-            tree.column("size1", width=80, anchor='center')  # Changed to center
-            tree.column("modified1", width=140, anchor='center')  # Changed to center
-            tree.column("file2", width=400, anchor='center')  # Changed to center
-            tree.column("size2", width=80, anchor='center')  # Changed to center
-            tree.column("modified2", width=140, anchor='center')  # Changed to center
-        else:
+            tree.column("file1", width=400, anchor='center')
+            tree.column("size1", width=80, anchor='center')
+            tree.column("modified1", width=140, anchor='center')
+            tree.column("file2", width=400, anchor='center')
+            tree.column("size2", width=80, anchor='center')
+            tree.column("modified2", width=140, anchor='center')
+        else:  # compare mode
             columns = ("delete", "new_file", "new_size", "new_modified", "existing_file", "existing_size", "existing_modified")
             tree = ttk.Treeview(table_frame, columns=columns, show='headings', 
                                yscrollcommand=tree_scroll.set, selectmode='none')
@@ -2183,12 +2253,12 @@ class PhotoOrganizer:
             tree.heading("existing_modified", text="Modified")
             
             tree.column("delete", width=80, anchor='center')
-            tree.column("new_file", width=400, anchor='center')  # Changed to center
-            tree.column("new_size", width=80, anchor='center')  # Changed to center
-            tree.column("new_modified", width=140, anchor='center')  # Changed to center
-            tree.column("existing_file", width=400, anchor='center')  # Changed to center
-            tree.column("existing_size", width=80, anchor='center')  # Changed to center
-            tree.column("existing_modified", width=140, anchor='center')  # Changed to center
+            tree.column("new_file", width=400, anchor='center')
+            tree.column("new_size", width=80, anchor='center')
+            tree.column("new_modified", width=140, anchor='center')
+            tree.column("existing_file", width=400, anchor='center')
+            tree.column("existing_size", width=80, anchor='center')
+            tree.column("existing_modified", width=140, anchor='center')
         
         tree_scroll.config(command=tree.yview)
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -2326,8 +2396,11 @@ class PhotoOrganizer:
         self.dup_results_frame.update_idletasks()
         self.dup_canvas.configure(scrollregion=self.dup_canvas.bbox("all"))
 
- 
-    
+
+
+
+
+
 
     def _create_duplicate_row_compare(self, idx, dup):
         """Create a row showing a duplicate pair for compare mode"""
